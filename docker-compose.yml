@@ -41,88 +41,91 @@ services:
   # ---------------------------------------------------------------------------
   selfcheck:
     <<: *common
-    command: selfcheck --load
+    entrypoint: ["/entrypoint.sh", "selfcheck"]
+    command: ["--load"]
 
   # ---------------------------------------------------------------------------
   # Unit & Integration Test Suite (CPU)
   # ---------------------------------------------------------------------------
   test:
     <<: *common
-    command: test -v
+    entrypoint: ["/entrypoint.sh", "test"]
+    command: ["-v"]
 
   # ---------------------------------------------------------------------------
   # GPU Smoke Tests (verifies real model weights on GPU)
   # ---------------------------------------------------------------------------
   test-gpu:
     <<: *common
-    command: test -m gpu tests/test_model_gpu.py
+    entrypoint: ["/entrypoint.sh", "test"]
+    command: ["-m", "gpu", "tests/test_model_gpu.py"]
 
   # ---------------------------------------------------------------------------
   # Tier 0: Baseline Evaluation
   # ---------------------------------------------------------------------------
   t0:
     <<: *common
-    command: t0
+    entrypoint: ["/entrypoint.sh", "t0"]
 
   # ---------------------------------------------------------------------------
   # Tier 1: Triage (Q_P, Q_R, Q_D)
   # ---------------------------------------------------------------------------
   t1:
     <<: *common
-    command: t1
+    entrypoint: ["/entrypoint.sh", "t1"]
 
   # ---------------------------------------------------------------------------
   # Tier 2: Interventions & Knobs (O1-O7, bgmask, quality sweeps)
   # ---------------------------------------------------------------------------
   t2:
     <<: *common
-    command: t2
+    entrypoint: ["/entrypoint.sh", "t2"]
 
   # ---------------------------------------------------------------------------
   # Latent-Hazard Track (FR-H-3/4/5)
   # ---------------------------------------------------------------------------
   hazard:
     <<: *common
-    command: hazard
+    entrypoint: ["/entrypoint.sh", "hazard"]
 
   # ---------------------------------------------------------------------------
   # Tier 3: Attribution & Localization
   # ---------------------------------------------------------------------------
   t3:
     <<: *common
-    command: t3
+    entrypoint: ["/entrypoint.sh", "t3"]
 
   # ---------------------------------------------------------------------------
   # Tier 4: Mechanistic Analysis (Probes, Logit Lens, Patching)
   # ---------------------------------------------------------------------------
   t4:
     <<: *common
-    command: t4
+    entrypoint: ["/entrypoint.sh", "t4"]
 
   # ---------------------------------------------------------------------------
   # Streaming Video Evaluation Track
   # ---------------------------------------------------------------------------
   stream:
     <<: *common
-    command: stream
+    entrypoint: ["/entrypoint.sh", "stream"]
 
   # ---------------------------------------------------------------------------
   # Validation Engine (Known-cause synthetic injections)
   # ---------------------------------------------------------------------------
   validate:
     <<: *common
-    command: validate
+    entrypoint: ["/entrypoint.sh", "validate"]
 
   # ---------------------------------------------------------------------------
   # Report Generation (root_causes.md and root_causes.csv)
   # ---------------------------------------------------------------------------
   report:
     <<: *common
-    command: report
+    entrypoint: ["/entrypoint.sh", "report"]
 
   # ---------------------------------------------------------------------------
   # Interactive Shell
   # ---------------------------------------------------------------------------
   shell:
     <<: *common
-    command: bash
+    entrypoint: ["/entrypoint.sh", "bash"]

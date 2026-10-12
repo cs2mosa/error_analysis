@@ -69,9 +69,13 @@ case "$CMD" in
         ;;
 
     # Run pytest test suite
-    test|pytest)
+    test|pytest|*.py|tests/*)
         echo "[ea-docker] Running pytest..."
-        exec pytest "$@"
+        if [ "$CMD" = "test" ] || [ "$CMD" = "pytest" ]; then
+            exec pytest "$@"
+        else
+            exec pytest "$CMD" "$@"
+        fi
         ;;
 
     # Interactive shell
