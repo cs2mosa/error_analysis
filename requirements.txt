@@ -1,0 +1,43 @@
+# =============================================================================
+# Qwen3-VL-4B Error Analysis Engine — Python Dependencies
+# =============================================================================
+
+# Scientific computing & statistics
+numpy==2.5.2
+pandas==3.0.6
+scipy==1.18.1
+scikit-learn==1.9.1
+statsmodels==0.15.0
+pyarrow==26.0.0
+
+# Media processing & visualization
+pillow==12.3.0
+opencv-python-headless==5.0.0.93
+av==18.1.0
+matplotlib==3.11.2
+seaborn==0.13.2
+
+# Deep Learning, VLM tooling & quantization
+transformers==5.17.0
+accelerate==1.15.0
+bitsandbytes==0.50.2
+qwen-vl-utils==0.0.14
+tokenizers==0.23.2
+safetensors==0.8.0
+huggingface-hub==1.33.0
+
+# Supporting utilities
+tqdm==4.70.1
+psutil==7.2.2
+pyyaml==6.0.3
+regex==2026.9.10
+filelock==3.32.3
+fsspec==2026.7.0
+packaging==26.3
+typing_extensions==4.16.0
+click==8.5.0
+httpx==0.28.1
+requests==2.34.2
+
+# Testing
+pytest==9.1.1

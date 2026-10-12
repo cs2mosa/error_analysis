@@ -1,0 +1,120 @@
+# =============================================================================
+# docker-compose.yml — Qwen3-VL Error Analysis Pipeline
+# =============================================================================
+# Usage:
+#   docker compose run selfcheck
+#   docker compose run test
+#   docker compose run t0
+#   docker compose run t1
+#   docker compose run t2
+#   docker compose run report
+#   docker compose run validate
+#   docker compose run shell
+# =============================================================================
+
+x-common: &common
+  image: qwen3vl-error-analysis:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  runtime: nvidia
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    - HF_HOME=/workspace/.hf_cache
+    - HF_TOKEN=${HF_TOKEN:-}
+    - MPLBACKEND=Agg
+    - PYTHONPATH=/workspace
+  volumes:
+    # Persist and mount local HuggingFace cache
+    - ${HF_CACHE_DIR:-./.hf_cache}:/workspace/.hf_cache
+    # Mount benchmark datasets (samples.jsonl + media)
+    - ${DATA_DIR:-./data}:/workspace/data
+    # Mount run outputs (CSVs, Parquet, manifests, reports)
+    - ${OUTPUTS_DIR:-./outputs}:/workspace/outputs
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Startup & Hardware Assertions (verifies model architecture & 8-bit load)
+  # ---------------------------------------------------------------------------
+  selfcheck:
+    <<: *common
+    command: selfcheck --load
+
+  # ---------------------------------------------------------------------------
+  # Unit & Integration Test Suite (CPU)
+  # ---------------------------------------------------------------------------
+  test:
+    <<: *common
+    command: test -v
+
+  # ---------------------------------------------------------------------------
+  # GPU Smoke Tests (verifies real model weights on GPU)
+  # ---------------------------------------------------------------------------
+  test-gpu:
+    <<: *common
+    command: test -m gpu tests/test_model_gpu.py
+
+  # ---------------------------------------------------------------------------
+  # Tier 0: Baseline Evaluation
+  # ---------------------------------------------------------------------------
+  t0:
+    <<: *common
+    command: t0
+
+  # ---------------------------------------------------------------------------
+  # Tier 1: Triage (Q_P, Q_R, Q_D)
+  # ---------------------------------------------------------------------------
+  t1:
+    <<: *common
+    command: t1
+
+  # ---------------------------------------------------------------------------
+  # Tier 2: Interventions & Knobs (O1-O7, bgmask, quality sweeps)
+  # ---------------------------------------------------------------------------
+  t2:
+    <<: *common
+    command: t2
+
+  # ---------------------------------------------------------------------------
+  # Tier 3: Attribution & Localization
+  # ---------------------------------------------------------------------------
+  t3:
+    <<: *common
+    command: t3
+
+  # ---------------------------------------------------------------------------
+  # Tier 4: Mechanistic Analysis (Probes, Logit Lens, Patching)
+  # ---------------------------------------------------------------------------
+  t4:
+    <<: *common
+    command: t4
+
+  # ---------------------------------------------------------------------------
+  # Streaming Video Evaluation Track
+  # ---------------------------------------------------------------------------
+  stream:
+    <<: *common
+    command: stream
+
+  # ---------------------------------------------------------------------------
+  # Validation Engine (Known-cause synthetic injections)
+  # ---------------------------------------------------------------------------
+  validate:
+    <<: *common
+    command: validate
+
+  # ---------------------------------------------------------------------------
+  # Report Generation (root_causes.md and root_causes.csv)
+  # ---------------------------------------------------------------------------
+  report:
+    <<: *common
+    command: report
+
+  # ---------------------------------------------------------------------------
+  # Interactive Shell
+  # ---------------------------------------------------------------------------
+  shell:
+    <<: *common
+    command: bash

@@ -1,0 +1,33 @@
+# config.yaml — all [PROPOSED] values & sweep grids (design.md §3.3; GC-6: no hidden constants)
+model:
+  name: Qwen/Qwen3-VL-4B-Instruct
+  path: F:/URCA_PROJECTS/.hf_cache/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17   # local snapshot; Windows HF cache symlinks unavailable
+seed: 0
+exit: {recovery: 0.5, control: 0.1, min_n: 10, conf_margin: 1.0}   # decisions use Wilson CIs (three-valued); errors with |s_base| < conf_margin are borderline and excluded from recovery tests [PROPOSED]
+necessity: {ratio: 0.25}
+consistency: {min_flip: 0.2, ratio: 2.0}
+cost: {miss: 10, false_alarm: 1}
+slices: {max_order: 2, min_support: 30, fdr: 0.05}
+crop: {margin: 0.25}
+knobs:
+  max_pixels: [low, native, high]       # fill numbers after reading the checkpoint config
+  token_budget: [1.0, 0.5, 0.25, 0.1]
+  fps: [1, 2, 5, 8]
+  window: [4, 8, 16, 32]
+  quant: [null, 8bit, 4bit]
+  quality: {kinds: [blur, lowlight, noise, haze, jpeg, resample], severities: [1,2,3,4,5]}
+sink: {ratio: 10}
+loc: {shortcut_enrichment: 1.5, equal_delta: 0.15}
+probe: {decodable_acc: 0.70, selectivity: 0.15}
+horizon: {frac: 0.95}
+stream: {tolerance_s: 2.0, k: 2, n: 3, c_miss: 1.0, c_early: 0.3, decay_s: 5.0, anticipation_s: 0.0}   # optional temporal early-warning window (0 = off). "Prediction" in this project = latent hazard (§5.14), not onset forecasting
+audit: {k_per_cluster: 20}
+answer: {min_mass: 0.5}                  # P(answer tokens) over the full vocab; below => row flagged invalid_format
+"null": {jpeg_q: 95, shift_px: 1}        # N0.null: the noise-floor control arm (key must be quoted: bare `null` parses as YAML null)
+attn: {band: upper_half}                 # layer band for attn_last (shallow layers attend mostly to text)
+patch: {corruptions: [pair, boxnoise]}   # >= 2 corruption methods required for a "causal" claim
+validate: {min_precision: 0.8, per_cause_n: 30, label_noise: 0.1}
+hazard: {min_agreement: 0.6}             # latent_hazard labels below this annotator agreement are capped at 'candidate' (own proposal)
+tests: {null_runs: 100, null_fpr_max: 0.1, planted_tpr_min: 0.9, finite_diff_rtol: 0.05, smd_max: 0.1, psnr_null_min_db: 40}   # §7.6 thresholds (own proposals)
+prompts:
+  paraphrases: 3                         # >= 3 D paraphrases (requirements §7)

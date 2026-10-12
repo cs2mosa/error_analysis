@@ -1,0 +1,38 @@
+# ============================================================
+# .dockerignore — exclude files that don't belong in the image
+# ============================================================
+
+# Python cache & artifacts
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache/
+
+# Local virtual environments
+.venv/
+.pip_cache/
+
+# HuggingFace model cache (mounted at runtime)
+.hf_cache/
+
+# IDE & system
+.idea/
+.vscode/
+.git/
+.tmp/
+Thumbs.db
+desktop.ini
+
+# Run outputs & caches (mounted at runtime via /workspace/outputs)
+outputs/
+cache/
+runs.jsonl
+failures.jsonl
+*.parquet
+
+# Large video / media files (mounted via /workspace/data)
+*.mp4
+*.avi
+*.mkv
+*.mov
