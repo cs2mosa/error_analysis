@@ -101,6 +101,29 @@ def _load_cfg(path):
     return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
+def _resolve_runs(path, for_write=False):
+    """Resolve runs.jsonl path.
+    If an explicit path was passed (different from the default 'runs.jsonl'), use it.
+    Otherwise:
+      - If 'outputs/runs.jsonl' already exists, use it.
+      - If 'runs.jsonl' exists in current dir, use it.
+      - If writing a new run and 'outputs/' exists, write to 'outputs/runs.jsonl'.
+      - Fallback: 'outputs/runs.jsonl' if 'outputs/' exists else 'runs.jsonl'.
+    """
+    from pathlib import Path
+    if path is not None and path not in ("runs.jsonl", "outputs/runs.jsonl"):
+        return str(path)
+    if Path("outputs/runs.jsonl").exists():
+        return "outputs/runs.jsonl"
+    if Path("runs.jsonl").exists():
+        return "runs.jsonl"
+    if for_write and Path("outputs").is_dir():
+        return "outputs/runs.jsonl"
+    if Path("outputs").is_dir():
+        return "outputs/runs.jsonl"
+    return "runs.jsonl"
+
+
 def _load_samples(data_dir, cfg, cmd=None):
     """Load samples.jsonl:
       1. Explicit path directly pointing to a folder with samples.jsonl.
@@ -179,7 +202,8 @@ def _run_report(args):
 
     cfg = _load_cfg(args.cfg)
     S = _load_samples(args.data, cfg, cmd=getattr(args, "cmd", None))
-    runs = load_runs(args.runs)
+    runs_path = _resolve_runs(args.runs)
+    runs = load_runs(runs_path)
     out = Path(args.out)
 
     clusters, _ = escalate(runs, S, cfg, out_dir=out)
@@ -205,14 +229,15 @@ def _run_tier(args):
 
     cfg = _load_cfg(args.cfg)
     S = _load_samples(args.data, cfg, cmd=getattr(args, "cmd", None))
+    runs_path = _resolve_runs(args.runs, for_write=True)
 
     if args.cmd == "t0":
         jobs = plan_t0(cfg, S)
     elif args.cmd in ("t1", "t2", "hazard"):
-        runs = load_runs(args.runs)
+        runs = load_runs(runs_path)
         et = errors_table(runs, S)
         if et.empty or "err" not in et.columns:
-            print(f"[{args.cmd}] no error samples found in {args.runs}. Run t0 first.")
+            print(f"[{args.cmd}] no error samples found in {runs_path}. Run t0 first.")
             return 1
         err = et[et.err == 1]
         cor = et[et.err == 0]
@@ -236,8 +261,8 @@ def _run_tier(args):
     if not jobs:
         print(f"[{args.cmd}] no jobs to run (no hazard-track samples/errors?)")
         return 0
-    n = run(jobs, S, cfg, out=args.runs, vlm_factory=factory)
-    print(f"[{args.cmd}] executed {n} new jobs -> {args.runs}")
+    n = run(jobs, S, cfg, out=runs_path, vlm_factory=factory)
+    print(f"[{args.cmd}] executed {n} new jobs -> {runs_path}")
     return 0
 
 
@@ -250,7 +275,8 @@ def _run_validate(args):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     S = _load_samples(args.data, cfg, cmd=getattr(args, "cmd", None))
-    runs = load_runs(args.runs)
+    runs_path = _resolve_runs(args.runs)
+    runs = load_runs(runs_path)
     validate(runs, S, cfg, out_dir=out)
     return 0
 
@@ -263,6 +289,7 @@ def _run_stream(args):
 
     cfg = _load_cfg(args.cfg)
     S = _load_samples(args.data, cfg, cmd=getattr(args, "cmd", None))
+    runs_path = _resolve_runs(args.runs, for_write=not getattr(args, "eval_only", False))
 
     if not getattr(args, "eval_only", False):
         jobs = plan_stream(cfg, S)
@@ -271,10 +298,10 @@ def _run_stream(args):
         def factory(mcfg):
             target = _model_ref(cfg, override=args.model)
             return VLM(target, **mcfg)
-        n = run(jobs, S, cfg, out=args.runs, vlm_factory=factory)
-        print(f"[stream] executed {n} streaming jobs -> {args.runs}")
+        n = run(jobs, S, cfg, out=runs_path, vlm_factory=factory)
+        print(f"[stream] executed {n} streaming jobs -> {runs_path}")
 
-    runs = load_runs(args.runs)
+    runs = load_runs(runs_path)
     out = Path(args.out)
     evaluate_stream(runs, S, cfg, tau=getattr(args, "tau", 0.0), out_dir=out)
     print(f"[stream] wrote summary and latency profile to {out}")
