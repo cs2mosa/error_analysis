@@ -23,6 +23,7 @@ x-common: &common
     - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     - HF_HOME=/workspace/.hf_cache
     - HF_TOKEN=${HF_TOKEN:-}
+    - BENCH=${BENCH:-}
     - MPLBACKEND=Agg
     - PYTHONPATH=/workspace
   volumes:
@@ -76,6 +77,13 @@ services:
   t2:
     <<: *common
     command: t2
+
+  # ---------------------------------------------------------------------------
+  # Latent-Hazard Track (FR-H-3/4/5)
+  # ---------------------------------------------------------------------------
+  hazard:
+    <<: *common
+    command: hazard
 
   # ---------------------------------------------------------------------------
   # Tier 3: Attribution & Localization

@@ -32,6 +32,12 @@ case "$CMD" in
         exec python -m ea t2 "$@"
         ;;
 
+    # Latent-hazard track
+    hazard)
+        echo "[ea-docker] Running latent-hazard track..."
+        exec python -m ea hazard "$@"
+        ;;
+
     # Tier T3: Attribution & Saliency
     t3)
         echo "[ea-docker] Running Tier 3 (attribution)..."

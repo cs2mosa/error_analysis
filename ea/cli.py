@@ -101,18 +101,74 @@ def _load_cfg(path):
     return yaml.safe_load(Path(path).read_text(encoding="utf-8"))
 
 
-def _load_samples(data_dir, cfg):
-    """Load samples.jsonl: --data may be the bench folder itself (data/toy) or
-    a root containing bench folders (data); the first bench found is used."""
+def _load_samples(data_dir, cfg, cmd=None):
+    """Load samples.jsonl:
+      1. Explicit path directly pointing to a folder with samples.jsonl.
+      2. Root directory containing existing bench sub-folders -> load cached bench.
+      3. Explicit known bench name (toy, cs10k, pasbench, ...) -> auto-download/generate.
+      4. No dataset passed within CLI / empty data dir:
+         Mirrors model weight resolution (_model_ref): auto-resolve default benchmark
+         (ENV -> cfg -> cs10k/pasbench), auto-download and persist locally (FR-D-2).
+    """
+    import os
     from pathlib import Path
-    from ea.data import load
-    p = Path(data_dir)
+    from ea.data import load, download_bench, _BENCH_REGISTRY
+
+    # Check environment variable overrides (e.g. DATA_PATH or BENCH)
+    env_data = os.environ.get("DATA_PATH") or os.environ.get("DATA_DIR")
+    if (not data_dir or data_dir == "data") and env_data:
+        data_dir = env_data
+
+    p = Path(data_dir) if data_dir else Path("data")
+
+    # Case 1: --data points directly at a bench folder with samples.jsonl
     if (p / "samples.jsonl").exists():
         return load(p.name, root=str(p.parent))
-    for child in sorted(p.glob("*/samples.jsonl")):
-        print(f"[data] no bench given; using {child.parent}")
-        return load(child.parent.name, root=str(p))
-    raise FileNotFoundError(f"no samples.jsonl under {data_dir}")
+
+    # Case 2: --data is a root containing bench sub-folders
+    if p.is_dir():
+        children = sorted(p.glob("*/samples.jsonl"))
+        if children:
+            target_child = children[0]
+            if cmd == "stream":
+                for c in children:
+                    if c.parent.name in ("pasbench", "ovo_bench_rt"):
+                        target_child = c
+                        break
+            print(f"[data] using local cached benchmark -> {target_child.parent}")
+            return load(target_child.parent.name, root=str(p))
+
+    # Case 3 / 4: treat data_dir as a bench name (either known registry or a path basename)
+    bench_name = p.name  # e.g. "toy", "cs10k", "pasbench"
+    root_dir = p.parent if p.parent != Path(".") and p.parent != p else Path("data")
+
+    # If data_dir itself looks like a known bench name (no path separators), resolve root
+    if str(data_dir) == bench_name or not p.parts[:-1]:
+        root_dir = Path("data")
+
+    if bench_name in _BENCH_REGISTRY or bench_name == "toy":
+        return download_bench(bench_name, root=root_dir)
+
+    # Case 4: No dataset passed within the CLI or data directory is empty.
+    # Mirrors the VLM model resolution (_model_ref): download once, persist locally.
+    if data_dir in (None, "data", ""):
+        default_bench = os.environ.get("BENCH") or os.environ.get("DATASET")
+        if not default_bench and cfg:
+            default_bench = (cfg.get("data", {}).get("bench") or
+                             cfg.get("data", {}).get("name") or
+                             cfg.get("bench"))
+        if not default_bench:
+            default_bench = "pasbench" if cmd == "stream" else "cs10k"
+
+        print(f"[data] no dataset passed within CLI; auto-downloading '{default_bench}' -> {root_dir / default_bench}")
+        return download_bench(default_bench, root=root_dir)
+
+    raise FileNotFoundError(
+        f"No samples.jsonl found under '{data_dir}'. "
+        f"Pass a bench folder path, a root containing bench folders, "
+        f"or a known bench name ({', '.join(sorted(_BENCH_REGISTRY))})."
+    )
+
 
 
 def _run_report(args):
@@ -122,7 +178,7 @@ def _run_report(args):
     from ea.report import write_report
 
     cfg = _load_cfg(args.cfg)
-    S = _load_samples(args.data, cfg)
+    S = _load_samples(args.data, cfg, cmd=getattr(args, "cmd", None))
     runs = load_runs(args.runs)
     out = Path(args.out)
 
@@ -148,7 +204,7 @@ def _run_tier(args):
                         load_runs, errors_table, match)
 
     cfg = _load_cfg(args.cfg)
-    S = _load_samples(args.data, cfg)
+    S = _load_samples(args.data, cfg, cmd=getattr(args, "cmd", None))
 
     if args.cmd == "t0":
         jobs = plan_t0(cfg, S)
@@ -193,7 +249,7 @@ def _run_validate(args):
     cfg = _load_cfg(args.cfg)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    S = _load_samples(args.data, cfg)
+    S = _load_samples(args.data, cfg, cmd=getattr(args, "cmd", None))
     runs = load_runs(args.runs)
     validate(runs, S, cfg, out_dir=out)
     return 0
@@ -206,7 +262,7 @@ def _run_stream(args):
     from ea.stream import evaluate_stream
 
     cfg = _load_cfg(args.cfg)
-    S = _load_samples(args.data, cfg)
+    S = _load_samples(args.data, cfg, cmd=getattr(args, "cmd", None))
 
     if not getattr(args, "eval_only", False):
         jobs = plan_stream(cfg, S)

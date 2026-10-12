@@ -92,7 +92,7 @@ def test_load_roundtrip(tmp_path):                              # FR-D-1
 
 
 def test_load_missing_raises_actionable(tmp_path):              # FR-D-1
-    with pytest.raises(FileNotFoundError, match="make_toy"):
+    with pytest.raises(FileNotFoundError, match="not in the known registry"):
         load("nope", root=tmp_path)
 
 
@@ -201,8 +201,25 @@ def test_frames_orders(tiny_video):                             # FR-D-6 orders
 
 @pytest.mark.parametrize("ad", ["adapter_construction_site10k", "adapter_isafetybench",
                                 "adapter_fieldworkarena", "adapter_pasbench_video",
-                                "adapter_ovo_bench_rt"])
+                                "adapter_ovo_bench_rt", "adapter_safebuild_bench"])
 def test_adapters_are_stubs(ad):                                # FR-D-2
     import ea.data as D
     with pytest.raises(NotImplementedError, match="VERIFY"):
         getattr(D, ad)()
+
+
+# ---------------------------------------------------------------- CLI auto-resolution & persistence
+
+def test_cli_load_samples_auto_resolves_and_persists(tmp_path, monkeypatch):
+    from ea.cli import _load_samples
+    # With BENCH set to toy and an isolated root, test auto-generation and persistence
+    monkeypatch.setenv("BENCH", "toy")
+    d = tmp_path / "data"
+    S = _load_samples(str(d / "toy"), cfg={})
+    assert len(S) == 200
+    assert (d / "toy" / "samples.jsonl").exists()
+
+    # Second call should use cached copy
+    S2 = _load_samples(str(d), cfg={})
+    assert len(S2) == 200
+    assert S2[0].id == S[0].id

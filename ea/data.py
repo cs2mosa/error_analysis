@@ -70,12 +70,80 @@ def write_jsonl(path, rows) -> None:
             f.write(json.dumps(r, sort_keys=True, ensure_ascii=False) + "\n")
 
 
-def load(bench: str, root: str | Path = "data") -> list[Sample]:
-    """Read data/<bench>/samples.jsonl (FR-D-1). The only raw-data reader."""
+# ---------------------------------------------------------------- dataset registry & auto-download
+
+# Maps bench name -> (hf_repo_id, converter_fn_name).
+# converter_fn receives (hf_dataset_dict, out_dir: Path) and writes samples.jsonl + media.
+# None converter means the bench is supported via make_toy (synthetic) or a manual adapter.
+_BENCH_REGISTRY: dict[str, tuple[str, str]] = {
+    "cs10k":        ("LouisChen15/ConstructionSite",      "_convert_cs10k"),
+    "isafetybench": ("raiyaanabdullah/isafety-bench",      "_convert_isafetybench"),
+    "fieldworkarena":("Fujitsu/FieldWorkArena_Dataset",   "_convert_fieldworkarena"),
+    "pasbench":     ("beingbetter11643/PaSBench-Video",   "_convert_pasbench"),
+    "ovo_bench_rt": ("JoeLeelyf/OVO-Bench",               "_convert_ovo_bench_rt"),
+    "toy":          (None,                                 None),  # synthetic
+}
+
+
+def download_bench(bench: str, root: str | Path = "data") -> list["Sample"]:
+    """Download a known benchmark from HF Hub, convert to samples.jsonl, persist, and return.
+
+    Mirrors the VLM model-resolution pattern: download once, cache locally,
+    use the local copy on every subsequent run (FR-D-2).
+
+    bench names recognised: toy, cs10k, isafetybench, fieldworkarena, pasbench,
+    ovo_bench_rt.  Any other name raises FileNotFoundError.
+    """
+    root = Path(root)
+    out_dir = root / bench
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    target_jsonl = out_dir / "samples.jsonl"
+    if target_jsonl.exists():
+        print(f"[data] using existing cached benchmark -> {target_jsonl}")
+        return [Sample.from_json(json.loads(l)) for l in open(target_jsonl, encoding="utf-8") if l.strip()]
+
+    if bench == "toy":
+        print(f"[data] auto-generating synthetic 'toy' dataset -> {out_dir}")
+        return make_toy(200, root=out_dir)
+
+    if bench not in _BENCH_REGISTRY:
+        known = ", ".join(sorted(_BENCH_REGISTRY))
+        raise FileNotFoundError(
+            f"No samples.jsonl found at {out_dir} and '{bench}' is not in the known registry "
+            f"(known: {known}). Provide your own samples.jsonl or use a known bench name.")
+
+    hf_repo, converter_name = _BENCH_REGISTRY[bench]
+    print(f"[data] '{bench}' not found locally; downloading from HF Hub '{hf_repo}' -> {out_dir}")
+    print(f"[data] This will be cached at {out_dir}/samples.jsonl for future offline runs.")
+
+    try:
+        import datasets as hf_datasets  # huggingface datasets library
+    except ImportError as e:
+        raise ImportError(
+            "The 'datasets' package is required for auto-download. "
+            "Install it with: pip install datasets"
+        ) from e
+
+    ds = hf_datasets.load_dataset(hf_repo, trust_remote_code=False)
+    converter = globals()[converter_name]
+    samples = converter(ds, out_dir)
+    write_jsonl(out_dir / "samples.jsonl", [__import__("dataclasses").asdict(s) for s in samples])
+    print(f"[data] wrote {len(samples)} samples -> {out_dir / 'samples.jsonl'}")
+    return samples
+
+
+def load(bench: str, root: str | Path = "data") -> list["Sample"]:
+    """Read data/<bench>/samples.jsonl (FR-D-1). The only raw-data reader.
+
+    If samples.jsonl is not present and the bench name is in the known registry,
+    the dataset is downloaded from HF Hub, converted, and persisted automatically
+    (same lazy-download pattern as the VLM weights).
+    """
     path = Path(root) / bench / "samples.jsonl"
     if not path.exists():
-        raise FileNotFoundError(
-            f"{path} not found. Run make_toy() or provide the benchmark via its adapter (FR-D-2).")
+        # Attempt auto-download for known benches (mirrors model _model_ref pattern).
+        return download_bench(bench, root=root)
     return [Sample.from_json(json.loads(l)) for l in open(path, encoding="utf-8") if l.strip()]
 
 
@@ -387,43 +455,231 @@ def make_toy(n: int = 200, root: str | Path = "data/toy", seed: int = 0) -> list
     return samples
 
 
-# ---------------------------------------------------------------- adapters (FR-D-2)
+# ---------------------------------------------------------------- converters (FR-D-2)
+# These convert HF Hub datasets to the Sample schema / samples.jsonl format.
+# Each converter receives (hf_dataset_dict, out_dir: Path) and returns list[Sample].
+# Media files are saved under out_dir/; samples.jsonl is written by download_bench().
+
 
 def _stub(name: str, verify_items: str):
     raise NotImplementedError(
         f"adapter {name}: needs access/format. [VERIFY] items: {verify_items}")
 
 
+def _convert_cs10k(ds, out_dir: Path) -> list["Sample"]:
+    """ConstructionSite10k (HF: LouisChen15/ConstructionSite) -> list[Sample].
+
+    Schema mapping (from Parquet inspection of the HF dataset):
+    - Uses the 'test' split (3,004 rows) for benchmarking.
+    - 'image' column: PIL Image.
+    - 'answer' column: free-form text; presence of safety-negative keywords -> label=1.
+    - 'question' column: used as rule_text.
+    - bounding boxes: stored as [ymin, xmin, ymax, xmax] normalized; re-ordered to xyxy.
+    [VERIFY] Parquet schema, bbox field names, label extraction heuristic.
+    """
+    import hashlib
+    split = "test" if "test" in ds else next(iter(ds))
+    rows = ds[split]
+    samples = []
+    img_dir = out_dir / "images"
+    img_dir.mkdir(exist_ok=True)
+
+    _NEG_KEYWORDS = {
+        "violation", "missing", "not wearing", "no helmet", "no vest",
+        "unsafe", "hazard", "danger", "absent", "without",
+    }
+
+    for i, row in enumerate(rows):
+        # Save image
+        img = row.get("image") or row.get("img")
+        if img is None:
+            continue
+        sid = f"cs10k_{i:05d}"
+        img_path = img_dir / f"{sid}.jpg"
+        if not img_path.exists():
+            img.convert("RGB").save(img_path, quality=90)
+
+        # Derive label from answer text heuristic
+        answer_raw = str(row.get("answer") or row.get("caption") or "")
+        answer_lower = answer_raw.lower()
+        label = int(any(kw in answer_lower for kw in _NEG_KEYWORDS))
+
+        # Rule text from question field
+        rule_text = str(row.get("question") or "Workers must follow construction site safety rules.")
+
+        # Bounding boxes: [ymin,xmin,ymax,xmax] -> xyxy
+        boxes = []
+        raw_boxes = row.get("bboxes") or row.get("bbox") or []
+        if isinstance(raw_boxes, list):
+            for b in raw_boxes:
+                if isinstance(b, (list, tuple)) and len(b) == 4:
+                    ymin, xmin, ymax, xmax = b
+                    boxes.append(dict(role="violator", xyxy=[xmin, ymin, xmax, ymax]))
+
+        samples.append(Sample(
+            id=sid, bench="cs10k", modality="image",
+            media=str(img_path.as_posix()),
+            label=label,
+            cls="rule_safety",
+            rule_text=rule_text,
+            item=None,
+            facts={},
+            boxes=boxes,
+            meta={"source": "CS10K", "split": split, "answer_raw": answer_raw[:200]},
+        ))
+    return samples
+
+
+def _convert_pasbench(ds, out_dir: Path) -> list["Sample"]:
+    """PaSBench-Video (HF: beingbetter11643/PaSBench-Video) -> list[Sample].
+
+    Schema mapping:
+    - 'video' column: video bytes or path.
+    - 'label' column: 1 = risk, 0 = safe (or derived from category).
+    - 'onset_s' / 'risk_start' column: risk onset timestamp.
+    - 'end_s' / 'risk_end' column: risk end timestamp.
+    [VERIFY] Exact column names, video storage format, timestamp units.
+    """
+    split = "test" if "test" in ds else next(iter(ds))
+    rows = ds[split]
+    samples = []
+    vid_dir = out_dir / "videos"
+    vid_dir.mkdir(exist_ok=True)
+
+    for i, row in enumerate(rows):
+        sid = f"pasbench_{i:05d}"
+
+        # Video: may be bytes, path string, or a dict with 'path'
+        video_data = row.get("video") or row.get("video_path")
+        if video_data is None:
+            continue
+        vid_path = vid_dir / f"{sid}.mp4"
+        if isinstance(video_data, bytes) and not vid_path.exists():
+            vid_path.write_bytes(video_data)
+        elif isinstance(video_data, str):
+            vid_path = Path(video_data)
+        elif isinstance(video_data, dict) and "path" in video_data:
+            vid_path = Path(video_data["path"])
+
+        label = int(row.get("label", row.get("risk", 1)))
+        onset_s = float(row.get("onset_s") or row.get("risk_start") or 0.0)
+        end_s = float(row.get("end_s") or row.get("risk_end") or onset_s + 5.0)
+        fps = float(row.get("fps", 8.0))
+        duration_s = float(row.get("duration_s") or end_s + 1.0)
+
+        samples.append(Sample(
+            id=sid, bench="pasbench", modality="video",
+            media=str(vid_path.as_posix()),
+            label=label,
+            cls="streaming_hazard",
+            rule_text="Proactive safety: identify risk events before they escalate.",
+            item=None,
+            facts={},
+            boxes=[],
+            video=dict(fps=fps, duration_s=duration_s, onset_s=onset_s, end_s=end_s),
+            meta={"source": "PaSBench-Video", "split": split,
+                  "category": str(row.get("category") or "")},
+        ))
+    return samples
+
+
+def _convert_isafetybench(ds, out_dir: Path) -> list["Sample"]:
+    """iSafetyBench (HF: raiyaanabdullah/isafety-bench) -> list[Sample].
+    [VERIFY] MCQ answer format, column names, video fps/duration fields.
+    """
+    _stub("isafetybench",
+          "MCQ to Yes/No translation, action-to-cls mapping, video fps/duration")
+
+
+def _convert_fieldworkarena(ds, out_dir: Path) -> list["Sample"]:
+    """FieldWorkArena (HF: Fujitsu/FieldWorkArena_Dataset) -> list[Sample].
+    [VERIFY] Task split (hazard vs procedural), facts extraction, video metadata.
+    """
+    _stub("fieldworkarena",
+          "task types, facts availability, license, video metadata")
+
+
+def _convert_ovo_bench_rt(ds, out_dir: Path) -> list["Sample"]:
+    """OVO-Bench RT subset (HF: JoeLeelyf/OVO-Bench) -> list[Sample].
+    [VERIFY] RT subset filtering, timestamp format, yes/no query framing.
+    """
+    _stub("ovo_bench_rt",
+          "RT subset definition, timestamps, query format, license")
+
+
 def adapter_construction_site10k(root="data"):
-    """ConstructionSite10k -> samples.jsonl.
-    [VERIFY] native annotation format & label semantics (plan §4); license;
-    split definition; whether boxes/facts per violation exist; image sizes."""
+    """ConstructionSite10k (CS10K) -> samples.jsonl.
+    Source: Chen & Zou, 'Are Large Pre-trained Vision Language Models Effective
+            Construction Safety Inspectors?' (Data-Centric Engineering / arXiv:2508.11011).
+    HF Hub: datasets.load_dataset('LouisChen15/ConstructionSite')
+    Scale:  10,013 images (7,009 train, 3,004 test in Parquet).
+    Tasks:  Image captioning, safety rule violation VQA, visual grounding (bboxes).
+    [VERIFY] items: Parquet schema mapping to Sample (bboxes [ymin,xmin,ymax,xmax]
+             normalized to xyxy [x0,y0,x1,y1]), rule text extraction into `rule_text`,
+             and mapping positive violation answers to label=1, compliant to label=0.
+    """
     _stub("construction_site10k", "format, labels, license, splits, boxes/facts availability")
 
 
 def adapter_isafetybench(root="data"):
     """iSafetyBench -> samples.jsonl.
-    [VERIFY] image/video subtask split; MCQ vs yes/no answer format (single-token
-    answers needed, FR-M-2); license; class taxonomy mapping to `cls`."""
+    Source: Abdullah et al., 'iSafetyBench: A Video-Language Benchmark for Safety in
+            Industrial Environments' (ICCV VISION Workshop / arXiv:2508.00399).
+    GitHub: https://github.com/iSafetyBench/data
+    HF Hub: datasets.load_dataset('raiyaanabdullah/isafety-bench')
+    Scale:  1,100 industrial video clips; 98 routine + 67 hazardous actions.
+    [VERIFY] items: MCQ to single-token Yes/No translation (FR-M-2 margin readout);
+             mapping action tags to `cls` taxonomy; video duration and fps extraction.
+    """
     _stub("isafetybench", "subtask split, answer format, license, taxonomy")
 
 
 def adapter_fieldworkarena(root="data"):
     """FieldWorkArena -> samples.jsonl.
-    [VERIFY] task types (detection vs VQA); annotation availability of facts;
-    license; video fps/duration metadata."""
+    Source: Fujitsu Research, 'FieldWorkArena: Agentic AI Benchmark for Real Field Work Tasks'
+            (arXiv:2505.19662).
+    GitHub: https://github.com/FujitsuResearch/FieldWorkArena
+    HF Hub: datasets.load_dataset('Fujitsu/FieldWorkArena_Dataset')
+    Scale:  Multi-modal enterprise data across manufacturing, warehouse, and retail.
+    [VERIFY] items: Task split (hazard detection vs procedural manual QA); extracting
+             facts; video timestamp/fps metadata.
+    """
     _stub("fieldworkarena", "task types, facts availability, license, video metadata")
 
 
 def adapter_pasbench_video(root="data"):
-    """PaSBench-Video -> samples.jsonl.
-    [VERIFY] frame-level risk-onset annotation format (FR-ST-3); accident
-    boundaries; no-risk (twin) clips for false alarms; license."""
+    """PaSBench-Video (Proactive Safety Bench) -> samples.jsonl.
+    Source: 'PaSBench-Video: A Streaming Video Benchmark for Proactive Safety Warning'
+            (arXiv:2606.02443).
+    HF Hub: datasets.load_dataset('beingbetter11643/PaSBench-Video')
+    Scale:  740 streaming videos (481 risk videos, 259 no-risk safe control videos)
+            across Driving, Daily Life, Healthcare, and Industrial production.
+    [VERIFY] items: Extracting `onset_s` (risk onset) and `end_s` (accident boundary)
+             into Sample.video dict; mapping 259 no-risk clips as twin controls (label 0).
+    """
     _stub("pasbench_video", "risk onset format, boundaries, twins, license")
 
 
 def adapter_ovo_bench_rt(root="data"):
     """OVO-Bench real-time subset -> samples.jsonl.
-    [VERIFY] RT subset definition & timestamps; query format (single-token
-    answers); license."""
+    Source: Lee et al., 'OVO-Bench: Online Video Benchmark for Video-LLMs'
+            (CVPR / arXiv:2501.05510).
+    GitHub: https://github.com/JoeLeelyf/OVO-Bench
+    HF Hub: datasets.load_dataset('JoeLeelyf/OVO-Bench')
+    Scale:  644 streaming videos; 3,000+ timestamp-anchored QA tasks.
+    [VERIFY] items: Filtering the 'Real-Time Understanding' task subset; mapping
+             timestamps to query points (t_end); framing yes/no margin verification queries.
+    """
     _stub("ovo_bench_rt", "RT subset definition, timestamps, query format, license")
+
+
+def adapter_safebuild_bench(root="data"):
+    """SafeBuild-Bench -> samples.jsonl.
+    Source: 'SafeBuild-Bench: Evaluating MLLMs on Industrial Construction Safety'
+            (arXiv:2608.00068).
+    Scale:  3,314 task instances from 3,000+ expert-verified images via GEMS pipeline.
+    Tasks:  Multiple-choice hazard identification, free-form hazard description.
+    [VERIFY] items: Mapping multiple-choice hazard categories into rule_text and cls;
+             mapping hazard present (1) vs safe compliant (0) into binary margin queries.
+    """
+    _stub("safebuild_bench", "GEMS instance format, hazard identification mapping, license")
