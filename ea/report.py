@@ -30,8 +30,8 @@ _T4_ONLY_CAUSES = frozenset({
     "readout/process (H3)", "merger bottleneck (H1)", "depth fading (H2)",
 })
 
-# Validated precision loaded from confusion.csv (may be empty).
-_PRECISION: dict[str, tuple[float, float, float]] = {}  # cause → (prec, lo, hi)
+# Validated precision is loaded per write_report call and threaded through
+# explicitly (BUG-20 fix: no module-level mutable global state).
 
 # Scope-of-evidence protocol disclosure (FR-E-12).
 _SCOPE_LIMITS = """
@@ -57,40 +57,43 @@ _SCOPE_LIMITS = """
 
 # ----------------------------------------------------------------- helpers
 
-def _load_precision(validate_csv: Path | None) -> None:
-    """Load per-cause precision from confusion.csv if available."""
-    global _PRECISION
-    _PRECISION = {}
-    if validate_csv is None or not validate_csv.exists():
-        return
+def _load_precision(validate_csv: Path | None) -> dict[str, tuple[float, float, float]]:
+    """Per-cause precision from confusion.csv if available (returns the dict —
+    the caller threads it into _decisive explicitly; no hidden global state)."""
+    if validate_csv is None or not Path(validate_csv).exists():
+        return {}
     df = pd.read_csv(validate_csv, index_col=0)
+    out: dict[str, tuple[float, float, float]] = {}
     for cause in df.index:
         if "precision" in df.columns:
             p = float(df.loc[cause, "precision"])
             lo = float(df.loc[cause, "prec_lo"]) if "prec_lo" in df.columns else np.nan
             hi = float(df.loc[cause, "prec_hi"]) if "prec_hi" in df.columns else np.nan
-            _PRECISION[str(cause)] = (p, lo, hi)
+            out[str(cause)] = (p, lo, hi)
+    return out
 
 
 def _decisive(cause: str, min_prec: float, agreement: float | None = None,
-              min_agreement: float = 0.6) -> str:
+              min_agreement: float = 0.6,
+              prec: dict[str, tuple[float, float, float]] | None = None) -> str:
     """Return 'decisive' or 'candidate (...)' label (FR-V-3).
 
     FR-H-6: the hazard cause is additionally capped at 'candidate' when the
     cluster's annotator agreement < hazard.min_agreement (subjective labels).
     """
+    prec = prec if prec is not None else {}
     if cause == "uncued-hazard under-reporting" and agreement is not None \
             and agreement < min_agreement:
         return f"candidate (annotator agreement {agreement:.2f} < hazard.min_agreement {min_agreement})"
     if cause in _T4_ONLY_CAUSES:
         # T4-only causes need the evidence rule to pass; always candidate otherwise
-        if cause in _PRECISION:
-            p, lo, hi = _PRECISION[cause]
+        if cause in prec:
+            p, lo, hi = prec[cause]
             if p >= min_prec:
                 return "decisive"
         return "candidate (evidence rule not yet verified)"
-    if cause in _PRECISION:
-        p, lo, hi = _PRECISION[cause]
+    if cause in prec:
+        p, lo, hi = prec[cause]
         label = f"validated precision {p:.2f} [{lo:.2f}, {hi:.2f}]"
         if p >= min_prec:
             return "decisive"
@@ -139,7 +142,8 @@ def _is_deployment(cause: str) -> bool:
 # ----------------------------------------------------------------- markdown sections
 
 def _cluster_section(c: dict, min_prec: float, validate_ok: bool,
-                     min_agreement: float = 0.6) -> str:
+                     min_agreement: float = 0.6,
+                     prec: dict[str, tuple[float, float, float]] | None = None) -> str:
     """One markdown section per cluster."""
     name = c["name"]
     n = c["n_errors"]
@@ -152,7 +156,7 @@ def _cluster_section(c: dict, min_prec: float, validate_ok: bool,
     agreement = c.get("agreement")
 
     dec = _decisive(cause, min_prec, agreement=agreement,
-                    min_agreement=min_agreement) if validate_ok \
+                    min_agreement=min_agreement, prec=prec) if validate_ok \
         else "candidate (validate not run)"
     side = "deployment" if _is_deployment(cause) else "architecture"
 
@@ -212,7 +216,7 @@ def write_report(
     clusters = json.loads(Path(clusters_path).read_text(encoding="utf-8"))
     diag_vec = pd.read_parquet(diag_vec_path)
     validate_ok = validate_csv is not None and Path(validate_csv).exists()
-    _load_precision(Path(validate_csv) if validate_csv else None)
+    prec = _load_precision(Path(validate_csv) if validate_csv else None)
 
     total_errors = len(diag_vec)
     cause_df = _cause_table(diag_vec)
@@ -243,7 +247,7 @@ def write_report(
     # Per-cluster sections
     md_lines += ["## Cluster details", ""]
     for c in clusters:
-        md_lines.append(_cluster_section(c, min_prec, validate_ok, min_agreement))
+        md_lines.append(_cluster_section(c, min_prec, validate_ok, min_agreement, prec=prec))
         md_lines.append("")
 
     # Accounting identity (FR-E-11)
@@ -275,7 +279,7 @@ def write_report(
     cause_df["implication"] = cause_df.cause.map(lambda c: IMPL.get(c, ""))
     cause_df["side"] = cause_df.cause.apply(lambda c: "deployment" if _is_deployment(c) else "architecture")
     cause_df["verdict"] = cause_df.cause.apply(
-        lambda c: _decisive(c, min_prec) if validate_ok else "candidate (validate not run)"
+        lambda c: _decisive(c, min_prec, prec=prec) if validate_ok else "candidate (validate not run)"
     )
     cause_df.to_csv(csv_path, index=False)
 

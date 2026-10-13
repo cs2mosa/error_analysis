@@ -50,7 +50,7 @@ def _img(s, root="."):
         from ea.data import frames
         dur = (s.video or {}).get("duration_s", 1.0)
         on = (s.video or {}).get("onset_s")
-        t_end = min(dur, (on if on is not None else dur) or dur)
+        t_end = min(dur, on if on is not None else dur)   # onset 0.0 is legitimate (BUG-10 family)
         imgs, _ = frames(media_path(s, root), fps=2, n=1, t_end=max(t_end, 0.0), single=True)
         return imgs[0]
     return I.open(media_path(s, root)).convert("RGB")
@@ -165,17 +165,18 @@ def o1_bgmask(s, root=".", margin=0.25, color=(128, 128, 128), **kw):
 
 @reg("O1.randmask", control=None, kind="control")
 def o1_randmask(s, root=".", margin=0.25, color=(128, 128, 128), **kw):
-    """Control: same-size box at a random location kept, rest grayed (IoU=0)."""
-    img = _img(s, root).copy()
-    W, H = img.size
+    """Control: same-size box at a random location KEPT AT FULL FIDELITY, rest
+    grayed (IoU=0 with the evidence box). BUG (fix): the kept box now shows
+    its actual pixels — the previous version painted it with the region's
+    mean colour, which flattened content and biased the bgmask comparison
+    toward recovery."""
+    src = np.asarray(_img(s, root))
+    H, W = src.shape[:2]
     b = _rand_box(s, np.random.default_rng(_seed(s, "randmask")), 0)
-    d = ImageDraw.Draw(img)
-    d.rectangle([0, 0, W, H], fill=color)
-    d.rectangle([int(b[0] * W), int(b[1] * H), int(b[2] * W), int(b[3] * H)],
-                fill=tuple(np.asarray(_img(s, root))[int(b[1] * H):int(b[3] * H),
-                                                             int(b[0] * W):int(b[2] * W)]
-                           .reshape(-1, 3).mean(0).astype(int)))
-    return [img], None
+    x0, y0, x1, y1 = _inside_rect(b, W, H)
+    out = np.full_like(src, color)
+    out[y0:y1, x0:x1] = src[y0:y1, x0:x1]                # real pixels, same convention as bgmask
+    return [Image.fromarray(out)], None
 
 
 @reg("O3.occlude", control="O3.randoccl", kind="necessity")
@@ -407,13 +408,18 @@ def hz_cue_twin(s, root=".", **kw):
 
 @reg("INJ.small", control=None, kind="inject")
 def inj_small(s, root=".", k=3, **kw):
-    """Put the image in the centre of a k-times larger reflect-padded canvas
+    """Put the image in the centre of a k-times larger REFLECT-PADDED canvas
     and rescale the box: with max_pixels fixed the object occupies fewer
-    tokens. Expected cause: pixel/token-budget limit (H1/H4)."""
+    tokens (design §5.8b). Expected cause: pixel/token-budget limit (H1/H4).
+    The padding mirrors the frame so the only systematic change is the
+    object's token share — a flat canvas would confound in an image-quality
+    effect (H9)."""
     img = _img(s, root)
-    W, H = img.size
-    canvas = Image.new("RGB", (W * k, H * k))
-    canvas.paste(img, ((W * k - W) // 2, (H * k - H) // 2))
+    a = np.asarray(img)
+    pad = np.pad(a, ((a.shape[0] * (k - 1) // 2, (k - 1) * a.shape[0] - a.shape[0] * (k - 1) // 2),
+                     (a.shape[1] * (k - 1) // 2, (k - 1) * a.shape[1] - a.shape[1] * (k - 1) // 2),
+                     (0, 0)), mode="reflect")
+    canvas = Image.fromarray(pad)
     import copy
     s2 = copy.deepcopy(s)
     s2.boxes = [{**b, "xyxy": [(x + (k - 1) / 2) / k for x in b["xyxy"]]}
@@ -430,22 +436,30 @@ def inj_clutter(s, root=".", m=4, others=None, **kw):
     import copy
     rng = np.random.default_rng(_seed(s, "injclutter"))
     W, H = img.size
-    vb = _violator_box(s)
+    vb = _violator_box(s)                                 # None on absence scenes (no box)
     s2 = copy.deepcopy(s)
     new_boxes = list(s.boxes)
     for j in range(int(m)):
         p = others[j % len(others)] if others else None
-        patch = _img(p, root) if p is not None else _gray(64, 64)
+        if p is None:
+            patch = _gray(64, 64)
+        elif isinstance(p, str):
+            patch = Image.open(p).convert("RGB")        # media path (validate passes paths)
+        else:
+            patch = _img(p, root)                        # Sample
         pw = rng.uniform(0.06, 0.12)
         side = int(pw * W)
         patch = patch.resize((side, side))
+        x = y = 0.0
+        bb = None
         for _ in range(100):
             x, y = rng.uniform(0, 1 - pw), rng.uniform(0, 1 - pw)
             bb = [x, y, x + pw, y + pw]
-            if bb[2] < vb[0] or bb[0] > vb[2] or bb[3] < vb[1] or bb[1] > vb[3]:
-                break
+            if vb is None or bb[2] < vb[0] or bb[0] > vb[2] or bb[3] < vb[1] or bb[1] > vb[3]:
+                break                                     # disjoint from the violator box
         img.paste(patch, (int(x * W), int(y * H)))
-        new_boxes.append(dict(role="person", xyxy=bb))
+        if bb is not None:
+            new_boxes.append(dict(role="person", xyxy=bb))
     s2.boxes = new_boxes
     return [img], s2
 

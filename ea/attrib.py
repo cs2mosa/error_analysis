@@ -14,10 +14,10 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import zlib
 import numpy as np
 import pandas as pd
 from PIL import Image, ImageFilter
-from scipy.ndimage import distance_transform_edt
 from sklearn.cluster import KMeans
 import torch
 
@@ -70,18 +70,21 @@ def map_grad(vlm, inp, pos=("Yes",), neg=("No",)) -> np.ndarray:
 
 # ----------------------------------------------------------------- FR-T3-2 localization
 
-def box_mask(box: list[float] | tuple[float, ...], grid_shape: tuple[int, int]) -> np.ndarray:
-    """Convert normalized [x0, y0, x1, y1] box to boolean mask on token grid."""
-    h, w = grid_shape
-    x0, y0, x1, y1 = box
-    r0, r1 = int(round(y0 * h)), int(round(y1 * h))
-    c0, c1 = int(round(x0 * w)), int(round(x1 * w))
-    r1 = max(r0 + 1, r1)
-    c1 = max(c0 + 1, c1)
-    m = np.zeros((h, w), dtype=bool)
-    m[max(0, min(r0, h)):min(r1, h), max(0, min(c0, w)):min(c1, w)] = True
-    if not m.any() and h > 0 and w > 0:
-        m[min(r0, h - 1), min(c0, w - 1)] = True
+def box_mask(box: list[float] | tuple[float, ...], grid_shape: tuple) -> np.ndarray:
+    """Convert normalized [x0, y0, x1, y1] box to a boolean mask on the token
+    grid — delegates to data.box_mask (BUG-06 fix).
+
+    data.box_mask is the single coordinate convention of the codebase
+    (floor on the low edges, ceil on the high edges; flat time-major mask for
+    (t, h, w) video grids). The old attrib-local implementation used round()
+    with a forced >= 1 cell, so T3 localization and T4 probe pooling measured
+    a *different region* than the intervention arms for the same box (90% of
+    random boxes differ). A 2-D grid returns an (h, w) mask; a (t, h, w)
+    grid returns the flat token mask."""
+    from ea.data import box_mask as _data_box_mask
+    m = _data_box_mask(box, grid_shape)
+    if len(grid_shape) == 2:
+        return m.reshape(grid_shape)
     return m
 
 
@@ -128,7 +131,9 @@ def three_way(enr_err: list[float] | np.ndarray, enr_cor: list[float] | np.ndarr
     enr_err = np.asarray(enr_err, dtype=float)
     enr_cor = np.asarray(enr_cor, dtype=float)
     if len(enr_err) == 0 or len(enr_cor) == 0:
-        return "loc_low_both"
+        # Abstain instead of voting for the scene-shortcut reading: an empty
+        # comparison is under-powered, and None never matches a SIG row.
+        return None
     m_err = float(np.median(enr_err))
     m_cor = float(np.median(enr_cor))
     if max(m_err, m_cor) < shortcut_enrichment:
@@ -140,8 +145,21 @@ def three_way(enr_err: list[float] | np.ndarray, enr_cor: list[float] | np.ndarr
 
 # ----------------------------------------------------------------- FR-T3-5 deletion / insertion
 
-def nli(img_arr: np.ndarray, mask: np.ndarray, noise_std: float | None = None) -> np.ndarray:
-    """Noisy Linear Imputation (ROAD, 2202.00449): debiased fill of masked pixels."""
+def nli(img_arr: np.ndarray, mask: np.ndarray,
+        noise_std: float | None = None, seed: int | None = None) -> np.ndarray:
+    """Noisy Linear Imputation (ROAD, 2202.00449; design §5.9 [VERIFY] item 11).
+
+    Each masked pixel is filled by LINEAR interpolation between the nearest
+    unmasked boundary pixels of its row (edge values extend flat runs at the
+    image border), then additive Gaussian noise calibrated to the unmasked
+    std is applied to the masked pixels only. This replaces the previous
+    nearest-neighbour fill, which is not the algorithm ROAD describes
+    (selfcheck item 11: verify against the authors' reference behaviour).
+
+    Determinism (BUG-09 fix): the noise RNG is seeded explicitly; the default
+    seed derives from the image bytes, so the same image+mask always yields
+    the same fill (NFR-1) without a global-RNG dependency.
+    """
     out = img_arr.copy()
     if not mask.any():
         return out
@@ -149,18 +167,46 @@ def nli(img_arr: np.ndarray, mask: np.ndarray, noise_std: float | None = None) -
     if not unmasked.any():
         return np.full_like(out, 128.0)
 
-    unmasked_pixels = img_arr[unmasked]
-    std_val = float(unmasked_pixels.std()) if noise_std is None else float(noise_std)
-    indices = distance_transform_edt(mask, return_distances=False, return_indices=True)
-    nearest_fill = img_arr[indices[0], indices[1]]
-    noise = np.random.normal(0, max(1.0, std_val * 0.5), size=out.shape)
-    out[mask] = nearest_fill[mask] + noise[mask]
+    if seed is None:
+        seed = zlib.crc32(np.ascontiguousarray(img_arr).tobytes()) % 2**31
+    rng = np.random.default_rng(int(seed))
+    std_val = float(img_arr[unmasked].std()) if noise_std is None else float(noise_std)
+
+    H, W = mask.shape
+    # rows with at least one unmasked pixel can be filled by row-wise
+    # interpolation; the remaining (fully masked) rows fall back to a column pass.
+    row_fillable = mask & unmasked.any(axis=1)[:, None]
+    remaining = mask & ~row_fillable
+    idx_cols, idx_rows = np.arange(W), np.arange(H)
+    for c in range(out.shape[2]):
+        ch = out[:, :, c].astype(np.float64)
+        for r in range(H):
+            mrow = row_fillable[r]
+            if not mrow.any():
+                continue
+            ku = idx_cols[~mask[r]]
+            ch[r, mrow] = np.interp(idx_cols[mrow], ku, ch[r, ku])
+        if remaining.any():                              # boundary = unmasked + row-filled
+            known = ~remaining
+            for col in range(W):
+                mcol = remaining[:, col]
+                if not mcol.any():
+                    continue
+                kcols = idx_rows[known[:, col]]
+                ch[mcol, col] = np.interp(idx_rows[mcol], kcols, ch[kcols, col])
+        out[:, :, c] = ch
+
+    noise = rng.normal(0, max(1.0, std_val * 0.5), size=out.shape)
+    out[mask] = out[mask] + noise[mask]
     return out
 
 
 def paint(img: Image.Image, cells: list[int] | np.ndarray, grid: tuple[int, int],
-          how: str = "nli") -> Image.Image:
-    """Mask specified cells in image space with given fill strategy (FR-T3-5; design §5.9)."""
+          how: str = "nli", seed: int | None = None) -> Image.Image:
+    """Mask specified cells in image space with given fill strategy (FR-T3-5; design §5.9).
+
+    seed: RNG seed for the nli fill (defaults to a hash of the image bytes —
+    deterministic for a given image+mask, NFR-1)."""
     a = np.asarray(img, dtype=np.float32)
     H, W = a.shape[:2]
     h, w = grid
@@ -175,16 +221,17 @@ def paint(img: Image.Image, cells: list[int] | np.ndarray, grid: tuple[int, int]
         blurred = np.asarray(img.filter(ImageFilter.GaussianBlur(8)), dtype=np.float32)
         a[m] = blurred[m]
     else:
-        a = nli(a, m)
+        a = nli(a, m, seed=seed)
     return Image.fromarray(a.clip(0, 255).astype(np.uint8))
 
 
 def del_ins(score_fn, img: Image.Image, amap: np.ndarray, mode: str = "del",
-            steps: int = 10, sign: int = 1, how: str = "nli") -> float:
+            steps: int = 10, sign: int = 1, how: str = "nli", seed: int | None = None) -> float:
     """Deletion/insertion area-under-the-curve (FR-T3-5; design §5.9).
 
     score_fn: callable(PIL.Image) -> float margin s
     sign: 2 * gold - 1 (positive indicates margin toward gold)
+    seed: forwarded to the nli fill for reproducibility (BUG-09 fix).
     """
     amap = np.asarray(amap, dtype=float)
     order = np.argsort(-amap.ravel())
@@ -193,7 +240,7 @@ def del_ins(score_fn, img: Image.Image, amap: np.ndarray, mode: str = "del",
     for f in np.linspace(0, 1, steps + 1):
         k = int(f * N)
         cells = order[:k] if mode == "del" else order[k:]
-        curve.append(sign * score_fn(paint(img, cells, amap.shape, how=how)))
+        curve.append(sign * score_fn(paint(img, cells, amap.shape, how=how, seed=seed)))
     _trapz = getattr(np, "trapezoid", getattr(np, "trapz", None))
     return float(_trapz(curve, dx=1.0 / steps))
 
@@ -202,25 +249,28 @@ def del_ins(score_fn, img: Image.Image, amap: np.ndarray, mode: str = "del",
 # ----------------------------------------------------------------- FR-T3-6 Explainer gate
 
 def explainer_validity_gate(score_fn, img: Image.Image, amap: np.ndarray,
-                            steps: int = 5, sign: int = 1) -> dict:
-    """Explainer-validity gate verifying deletion/insertion properties (FR-T3-6)."""
+                            steps: int = 5, sign: int = 1, seed: int = 0) -> dict:
+    """Explainer-validity gate verifying deletion/insertion properties (FR-T3-6).
+
+    seed controls both the random comparison map and the nli fill, so the
+    gate verdict is reproducible (BUG-09 fix; NFR-1)."""
     amap = np.asarray(amap, dtype=float)
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(seed)
     rand_map = rng.uniform(0, 1, size=amap.shape)
 
-    d_expl = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="nli")
-    d_rand = del_ins(score_fn, img, rand_map, mode="del", steps=steps, sign=sign, how="nli")
+    d_expl = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="nli", seed=seed)
+    d_rand = del_ins(score_fn, img, rand_map, mode="del", steps=steps, sign=sign, how="nli", seed=seed)
 
-    i_expl = del_ins(score_fn, img, amap, mode="ins", steps=steps, sign=sign, how="nli")
-    i_rand = del_ins(score_fn, img, rand_map, mode="ins", steps=steps, sign=sign, how="nli")
+    i_expl = del_ins(score_fn, img, amap, mode="ins", steps=steps, sign=sign, how="nli", seed=seed)
+    i_rand = del_ins(score_fn, img, rand_map, mode="ins", steps=steps, sign=sign, how="nli", seed=seed)
 
     # Faithful explainer should have lower deletion AUC and higher insertion AUC than random
     del_beats_rand = bool(d_expl <= d_rand + 1e-4)
     ins_beats_rand = bool(i_expl >= i_rand - 1e-4)
 
     # Fill stability: check del AUC under gray and blur
-    d_gray = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="gray")
-    d_blur = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="blur")
+    d_gray = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="gray", seed=seed)
+    d_blur = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="blur", seed=seed)
     fill_stable = bool(abs(d_gray - d_blur) < 5.0)
 
     valid = bool(del_beats_rand and ins_beats_rand and fill_stable)

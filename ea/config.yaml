@@ -1,7 +1,9 @@
 # config.yaml — all [PROPOSED] values & sweep grids (design.md §3.3; GC-6: no hidden constants)
 model:
   name: Qwen/Qwen3-VL-4B-Instruct
-  path: F:/URCA_PROJECTS/.hf_cache/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17   # local snapshot; Windows HF cache symlinks unavailable
+  # BUG-13: machine-specific local snapshot lives in config.local.yaml
+  # (git-ignored); this file stays portable. Resolution order: --model >
+  # MODEL_PATH env > config.local.yaml model.path > $HF_HOME snapshot > repo name.
 seed: 0
 exit: {recovery: 0.5, control: 0.1, min_n: 10, conf_margin: 1.0}   # decisions use Wilson CIs (three-valued); errors with |s_base| < conf_margin are borderline and excluded from recovery tests [PROPOSED]
 necessity: {ratio: 0.25}
@@ -10,7 +12,11 @@ cost: {miss: 10, false_alarm: 1}
 slices: {max_order: 2, min_support: 30, fdr: 0.05}
 crop: {margin: 0.25}
 knobs:
-  max_pixels: [low, native, high]       # fill numbers after reading the checkpoint config
+  # BUG-04: numbers filled from the checkpoint's preprocessor_config.json
+  # (shortest_edge=65536, longest_edge=16777216). native=null = the checkpoint
+  # default; high pins the checkpoint's own cap explicitly (uncapped images);
+  # low is the degraded-resolution deployment arm (512^2 px area).
+  max_pixels: {low: 262144, native: null, high: 16777216}
   token_budget: [1.0, 0.5, 0.25, 0.1]
   fps: [1, 2, 5, 8]
   window: [4, 8, 16, 32]
@@ -19,8 +25,10 @@ knobs:
 sink: {ratio: 10}
 loc: {shortcut_enrichment: 1.5, equal_delta: 0.15}
 probe: {decodable_acc: 0.70, selectivity: 0.15}
+t4: {max_samples: 40}
 horizon: {frac: 0.95}
-stream: {tolerance_s: 2.0, k: 2, n: 3, c_miss: 1.0, c_early: 0.3, decay_s: 5.0, anticipation_s: 0.0}   # optional temporal early-warning window (0 = off). "Prediction" in this project = latent hazard (§5.14), not onset forecasting
+stream: {tolerance_s: 2.0, k: 2, n: 3, c_miss: 1.0, c_early: 0.3, decay_s: 5.0, anticipation_s: 0.0, step_s: 1.0, window: 4, fps: 2.0}   # step_s/window/fps added (BUG-10): the protocol header must report the real settings
+t2: {extra_arms: true}                     # BUG-18: arms no diagnostic consumes yet; set false to save GPU time
 audit: {k_per_cluster: 20}
 answer: {min_mass: 0.5}                  # P(answer tokens) over the full vocab; below => row flagged invalid_format
 "null": {jpeg_q: 95, shift_px: 1}        # N0.null: the noise-floor control arm (key must be quoted: bare `null` parses as YAML null)

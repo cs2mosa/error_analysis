@@ -49,7 +49,7 @@ def test_end_to_end_pipeline(tmp_path):
         "model": {"name": "fake-vlm"},
         "answer": {"min_mass": 0.5},
         "exit": {"recovery": 0.5, "control": 0.1, "min_n": 2, "conf_margin": 0.5},
-        "slices": {"max_order: 1": 1, "min_support": 2, "fdr": 0.05},
+        "slices": {"max_order": 1, "min_support": 2, "fdr": 0.05},
         "validate": {"min_precision": 0.8, "per_cause_n": 10, "label_noise": 0.1},
         "audit": {"k_per_cluster": 5},
         "knobs": {"quality": {"kinds": ["blur"], "severities": [1]}},
@@ -105,9 +105,10 @@ def test_end_to_end_pipeline(tmp_path):
 
     runs = R.load_runs(runs_path)
 
-    # 5. Validate runner
+    # 5. Validate runner (real injections through the scripted model, BUG-01)
     val_dir = tmp_path / "outputs" / "validate"
-    confusion_csv = R.validate(runs, S, cfg, out_dir=val_dir)
+    confusion_csv = R.validate(runs, S, cfg, out_dir=val_dir,
+                               vlm_factory=vlm_factory)
     assert confusion_csv.exists()
     conf_df = pd.read_csv(confusion_csv, index_col=0)
     assert "precision" in conf_df.columns

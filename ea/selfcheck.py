@@ -15,28 +15,13 @@ from pathlib import Path
 import torch
 import yaml
 
+from ea import model_ref
+
 
 def _model_ref(cfg, override=None):
-    """Resolve the model to load: explicit override > MODEL_PATH env > cfg.model.path > HF_HOME snapshot > repo name."""
-    if override:
-        return override
-    env_p = __import__("os").environ.get("MODEL_PATH")
-    if env_p:
-        ep = Path(env_p)
-        if ep.exists() or (not env_p.startswith("/") and not env_p.startswith(".") and ":" not in env_p):
-            return env_p
-    if cfg and cfg.get("model", {}).get("path"):
-        p = Path(cfg["model"]["path"])
-        if p.exists():
-            return str(p)
-    name = (cfg.get("model", {}).get("name") if cfg else None) or "Qwen/Qwen3-VL-4B-Instruct"
-    hf_home = Path(str(__import__("os").environ.get("HF_HOME", "")))
-    local = hf_home / "hub" / f"models--{name.replace('/', '--')}"
-    if local.exists():
-        snaps = sorted((local / "snapshots").glob("*"))
-        if snaps:
-            return str(snaps[-1])
-    return name
+    """Compatibility wrapper — the implementation lives in ea.model_ref
+    (BUG-12 fix: one resolver, one precedence chain)."""
+    return model_ref(cfg, override=override)
 
 
 def _meta_model(mp):

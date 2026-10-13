@@ -114,8 +114,30 @@ def download_bench(bench: str, root: str | Path = "data") -> list["Sample"]:
             f"(known: {known}). Provide your own samples.jsonl or use a known bench name.")
 
     hf_repo, converter_name = _BENCH_REGISTRY[bench]
-    print(f"[data] '{bench}' not found locally; downloading from HF Hub '{hf_repo}' -> {out_dir}")
-    print(f"[data] This will be cached at {out_dir}/samples.jsonl for future offline runs.")
+
+    # Prefer a local git clone of the HF dataset repo over a network download.
+    # Recognised clone directory names: <bench>_raw, <bench>_repo, <bench>_clone,
+    # or <bench>/ itself if cloned directly into the target directory.
+    # Example: git clone https://huggingface.co/datasets/LouisChen15/ConstructionSite \
+    #            ./data/cs10k_raw
+    _clone_candidates = [
+        root / f"{bench}_raw",
+        root / f"{bench}_repo",
+        root / f"{bench}_clone",
+    ]
+    # If out_dir itself already contains cloned repository files (.git or .parquet)
+    if (out_dir / ".git").is_dir() or any(out_dir.glob("*.parquet")) or any(out_dir.glob("**/*.parquet")):
+        _clone_candidates.insert(0, out_dir)
+
+    _local_src = next((c for c in _clone_candidates if c.is_dir()), None)
+
+    if _local_src:
+        print(f"[data] found local clone -> {_local_src}; loading offline (no HF auth required)")
+        load_source = str(_local_src)
+    else:
+        print(f"[data] '{bench}' not found locally; downloading from HF Hub '{hf_repo}' -> {out_dir}")
+        print(f"[data] This will be cached at {out_dir}/samples.jsonl for future offline runs.")
+        load_source = hf_repo
 
     try:
         import datasets as hf_datasets  # huggingface datasets library
@@ -125,7 +147,29 @@ def download_bench(bench: str, root: str | Path = "data") -> list["Sample"]:
             "Install it with: pip install datasets"
         ) from e
 
-    ds = hf_datasets.load_dataset(hf_repo, trust_remote_code=False)
+    try:
+        ds = hf_datasets.load_dataset(load_source, trust_remote_code=False)
+    except Exception as e:
+        # If loading a local clone directory fails (e.g. no dataset script), fall back to parquet/json files
+        if _local_src and Path(_local_src).is_dir():
+            p_src = Path(_local_src)
+            parquet_files = sorted(list(p_src.glob("**/*.parquet")))
+            json_files = sorted(list(p_src.glob("**/*.json")) + list(p_src.glob("**/*.jsonl")))
+            json_files = [j for j in json_files if j.name != "samples.jsonl"]
+            if parquet_files:
+                splits: dict[str, list[str]] = {}
+                for p in parquet_files:
+                    stem = p.stem.lower()
+                    sp = "test" if "test" in stem else ("train" if "train" in stem else "validation")
+                    splits.setdefault(sp, []).append(str(p))
+                ds = hf_datasets.load_dataset("parquet", data_files=splits)
+            elif json_files:
+                ds = hf_datasets.load_dataset("json", data_files=[str(j) for j in json_files])
+            else:
+                raise e
+        else:
+            raise e
+
     converter = globals()[converter_name]
     samples = converter(ds, out_dir)
     write_jsonl(out_dir / "samples.jsonl", [__import__("dataclasses").asdict(s) for s in samples])
@@ -466,6 +510,39 @@ def _stub(name: str, verify_items: str):
         f"adapter {name}: needs access/format. [VERIFY] items: {verify_items}")
 
 
+def _extract_image(img_obj) -> Image.Image | None:
+    """Helper to convert various image representations (PIL, dict, bytes, path) into a PIL Image."""
+    if img_obj is None:
+        return None
+    if isinstance(img_obj, Image.Image):
+        return img_obj
+    import io
+    if isinstance(img_obj, dict):
+        raw_b = img_obj.get("bytes")
+        if raw_b:
+            try:
+                return Image.open(io.BytesIO(raw_b))
+            except Exception:
+                return None
+        p_val = img_obj.get("path")
+        if p_val and Path(p_val).exists():
+            try:
+                return Image.open(p_val)
+            except Exception:
+                return None
+    if isinstance(img_obj, (bytes, bytearray)):
+        try:
+            return Image.open(io.BytesIO(img_obj))
+        except Exception:
+            return None
+    if isinstance(img_obj, (str, Path)) and Path(img_obj).exists():
+        try:
+            return Image.open(img_obj)
+        except Exception:
+            return None
+    return None
+
+
 def _convert_cs10k(ds, out_dir: Path) -> list["Sample"]:
     """ConstructionSite10k (HF: LouisChen15/ConstructionSite) -> list[Sample].
 
@@ -491,7 +568,7 @@ def _convert_cs10k(ds, out_dir: Path) -> list["Sample"]:
 
     for i, row in enumerate(rows):
         # Save image
-        img = row.get("image") or row.get("img")
+        img = _extract_image(row.get("image") or row.get("img"))
         if img is None:
             continue
         sid = f"cs10k_{i:05d}"
@@ -543,6 +620,7 @@ def _convert_pasbench(ds, out_dir: Path) -> list["Sample"]:
     split = "test" if "test" in ds else next(iter(ds))
     rows = ds[split]
     samples = []
+    skipped = 0
     vid_dir = out_dir / "videos"
     vid_dir.mkdir(exist_ok=True)
 
@@ -554,18 +632,36 @@ def _convert_pasbench(ds, out_dir: Path) -> list["Sample"]:
         if video_data is None:
             continue
         vid_path = vid_dir / f"{sid}.mp4"
-        if isinstance(video_data, bytes) and not vid_path.exists():
+        if isinstance(video_data, (bytes, bytearray)) and not vid_path.exists():
             vid_path.write_bytes(video_data)
         elif isinstance(video_data, str):
             vid_path = Path(video_data)
-        elif isinstance(video_data, dict) and "path" in video_data:
-            vid_path = Path(video_data["path"])
+        elif isinstance(video_data, dict):
+            raw_bytes = video_data.get("bytes")
+            if raw_bytes and not vid_path.exists():
+                vid_path.write_bytes(raw_bytes)
+            elif video_data.get("path"):
+                vid_path = Path(video_data["path"])
 
         label = int(row.get("label", row.get("risk", 1)))
-        onset_s = float(row.get("onset_s") or row.get("risk_start") or 0.0)
-        end_s = float(row.get("end_s") or row.get("risk_end") or onset_s + 5.0)
+        # Risk onset is never defaulted to 0.0 (BUG-11 fix): a silent default
+        # corrupts every timing metric and compounds the falsy-0 onset bug in
+        # stream.py. Risk videos without onset/boundary are skipped, counted.
+        onset_raw = row.get("onset_s", row.get("risk_start"))
+        end_raw = row.get("end_s", row.get("risk_end"))
+        if onset_raw is None or end_raw is None:
+            if label == 1:
+                skipped += 1
+                continue
+            onset_s = end_s = None
+        else:
+            onset_s = float(onset_raw)
+            end_s = float(end_raw)
+            if end_s < onset_s:
+                skipped += 1
+                continue
         fps = float(row.get("fps", 8.0))
-        duration_s = float(row.get("duration_s") or end_s + 1.0)
+        duration_s = float(row.get("duration_s") or ((end_s or 0.0) + 1.0))
 
         samples.append(Sample(
             id=sid, bench="pasbench", modality="video",
@@ -580,31 +676,353 @@ def _convert_pasbench(ds, out_dir: Path) -> list["Sample"]:
             meta={"source": "PaSBench-Video", "split": split,
                   "category": str(row.get("category") or "")},
         ))
+    if skipped:
+        print(f"[pasbench] skipped {skipped} risk videos without onset/boundary "
+              "timestamps (NFR-5: counted, never silently defaulted)")
     return samples
 
 
 def _convert_isafetybench(ds, out_dir: Path) -> list["Sample"]:
     """iSafetyBench (HF: raiyaanabdullah/isafety-bench) -> list[Sample].
-    [VERIFY] MCQ answer format, column names, video fps/duration fields.
+
+    Schema (from HF API + GitHub inspection):
+    - Splits: 'train' only (1,100 short industrial video clips, 4-8s each).
+    - File layout on HF: hazard/<video_id>.mp4  and  normal/<video_id>.mp4
+      The split is encoded in the filename prefix, not a dedicated column.
+    - HF dataset columns (Croissant): 'video' (VideoObject/bytes) + 'label' (integer).
+      When loaded via load_dataset the 'video' value is a dict with key 'path'
+      or raw bytes depending on the streaming mode.
+    - label integer: the dataset is multi-label (action ids), but for binary
+      hazard detection we map: any row coming from the hazard/ subtree -> 1,
+      normal/ subtree -> 0.  We detect this from the video path embedded in
+      the 'video' field or from the 'label' value (0 == normal by convention).
+    - cls: 'industrial_hazard' for hazard clips, 'industrial_normal' for safe.
+    - No bounding boxes or MCQ in this HF release; facts are empty.
     """
-    _stub("isafetybench",
-          "MCQ to Yes/No translation, action-to-cls mapping, video fps/duration")
+    split = "train" if "train" in ds else next(iter(ds))
+    rows = ds[split]
+    samples = []
+    vid_dir = out_dir / "videos"
+    vid_dir.mkdir(exist_ok=True)
+
+    for i, row in enumerate(rows):
+        sid = f"isafetybench_{i:05d}"
+
+        # Video field: dict with 'path' key, or raw bytes, or a file-like object.
+        video_data = row.get("video") or row.get("video_path")
+        if video_data is None:
+            continue
+
+        vid_path = vid_dir / f"{sid}.mp4"
+        src_path_str = ""
+        if isinstance(video_data, dict):
+            src_path_str = str(video_data.get("path") or video_data.get("bytes") or "")
+            raw_bytes = video_data.get("bytes")
+            if raw_bytes and not vid_path.exists():
+                vid_path.write_bytes(raw_bytes)
+            elif video_data.get("path"):
+                vid_path = Path(video_data["path"])
+        elif isinstance(video_data, bytes) and not vid_path.exists():
+            vid_path.write_bytes(video_data)
+        elif isinstance(video_data, str):
+            src_path_str = video_data
+            vid_path = Path(video_data)
+
+        # Infer hazard/normal from file path prefix or label column.
+        # HF layout: hazard/<id>.mp4 vs normal/<id>.mp4.
+        raw_label = row.get("label")
+        if src_path_str:
+            is_hazard = "hazard" in src_path_str.replace("\\", "/").lower()
+        elif raw_label is not None:
+            # label=0 typically means 'normal' in this dataset's int mapping;
+            # any nonzero label encodes a hazardous action category index.
+            is_hazard = (int(raw_label) != 0)
+        else:
+            is_hazard = False
+
+        label = 1 if is_hazard else 0
+        cls = "industrial_hazard" if is_hazard else "industrial_normal"
+        rule_text = (
+            "Industrial safety: identify hazardous or unsafe actions in the video."
+            if is_hazard else
+            "Industrial safety: confirm this clip shows routine, safe operations."
+        )
+
+        action_tag = str(row.get("action") or row.get("action_label") or "").strip()
+        meta: dict = {
+            "source": "iSafetyBench",
+            "split": split,
+            "scene_type": "hazard" if is_hazard else "normal",
+        }
+        if action_tag:
+            meta["action_tag"] = action_tag
+        if raw_label is not None:
+            meta["raw_label"] = int(raw_label)
+
+        samples.append(Sample(
+            id=sid, bench="isafetybench", modality="video",
+            media=str(vid_path.as_posix()),
+            label=label,
+            cls=cls,
+            rule_text=rule_text,
+            item=None,
+            facts={},
+            boxes=[],
+            video=dict(fps=8.0, duration_s=6.0, onset_s=0.0, end_s=6.0),
+            meta=meta,
+        ))
+    return samples
 
 
 def _convert_fieldworkarena(ds, out_dir: Path) -> list["Sample"]:
     """FieldWorkArena (HF: Fujitsu/FieldWorkArena_Dataset) -> list[Sample].
-    [VERIFY] Task split (hazard vs procedural), facts extraction, video metadata.
+
+    Schema (from HF dataset siblings + arXiv:2505.19662):
+    - Multi-modal enterprise benchmark (manufacturing, warehouse, retail).
+    - Gated dataset requiring a Fujitsu application in addition to HF access.
+    - Expected columns: 'video'/'image' (media), 'question', 'answer',
+      'task_type' (e.g. 'hazard_detection', 'procedure_verification'),
+      'label' or 'is_violation' (int/bool), optionally 'facts' (dict/str).
+    - Binary label: hazard present / procedure violated -> 1, safe -> 0.
+    - When task_type is not present we fall back to answer-based heuristics.
     """
-    _stub("fieldworkarena",
-          "task types, facts availability, license, video metadata")
+    split = "test" if "test" in ds else next(iter(ds))
+    rows = ds[split]
+    samples = []
+    media_dir = out_dir / "media"
+    media_dir.mkdir(exist_ok=True)
+
+    _HAZARD_KEYWORDS = {
+        "hazard", "danger", "unsafe", "violation", "incorrect", "wrong",
+        "missing", "absent", "not wearing", "not following",
+    }
+
+    for i, row in enumerate(rows):
+        sid = f"fieldworkarena_{i:05d}"
+
+        # Detect modality
+        video_data = row.get("video") or row.get("video_path")
+        image_data = row.get("image") or row.get("img")
+        modality = "video" if video_data is not None else "image"
+
+        # Save media
+        media_path: Path
+        if modality == "video":
+            media_path = media_dir / f"{sid}.mp4"
+            if isinstance(video_data, dict):
+                raw = video_data.get("bytes")
+                if raw and not media_path.exists():
+                    media_path.write_bytes(raw)
+                elif video_data.get("path"):
+                    media_path = Path(video_data["path"])
+            elif isinstance(video_data, bytes) and not media_path.exists():
+                media_path.write_bytes(video_data)
+            elif isinstance(video_data, str):
+                media_path = Path(video_data)
+        else:
+            media_path = media_dir / f"{sid}.jpg"
+            img = _extract_image(image_data)
+            if img is not None and not media_path.exists():
+                try:
+                    img.convert("RGB").save(media_path, quality=90)
+                except Exception:
+                    pass
+
+        # Derive label
+        explicit_label = row.get("label") or row.get("is_violation")
+        if explicit_label is not None:
+            label = int(bool(explicit_label))
+        else:
+            answer_text = str(row.get("answer") or "").lower()
+            label = int(any(kw in answer_text for kw in _HAZARD_KEYWORDS))
+
+        task_type = str(row.get("task_type") or row.get("category") or "fieldwork_task")
+        question = str(row.get("question") or row.get("prompt") or
+                       "Does this clip contain a safety violation or procedural error?")
+
+        # Extract facts if provided as a dict/string
+        facts_raw = row.get("facts") or row.get("context") or {}
+        if isinstance(facts_raw, str):
+            try:
+                facts: dict = json.loads(facts_raw)
+            except Exception:
+                facts = {"context": facts_raw}
+        elif isinstance(facts_raw, dict):
+            facts = facts_raw
+        else:
+            facts = {}
+
+        video_meta = None
+        if modality == "video":
+            video_meta = dict(
+                fps=float(row.get("fps") or 8.0),
+                duration_s=float(row.get("duration_s") or row.get("duration") or 10.0),
+                onset_s=0.0,
+                end_s=float(row.get("duration_s") or row.get("duration") or 10.0),
+            )
+
+        samples.append(Sample(
+            id=sid, bench="fieldworkarena", modality=modality,
+            media=str(media_path.as_posix()),
+            label=label,
+            cls=task_type,
+            rule_text=question,
+            item=None,
+            facts=facts,
+            boxes=[],
+            video=video_meta,
+            meta={
+                "source": "FieldWorkArena",
+                "split": split,
+                "task_type": task_type,
+                "answer_raw": str(row.get("answer") or "")[:200],
+            },
+        ))
+    return samples
 
 
 def _convert_ovo_bench_rt(ds, out_dir: Path) -> list["Sample"]:
     """OVO-Bench RT subset (HF: JoeLeelyf/OVO-Bench) -> list[Sample].
-    [VERIFY] RT subset filtering, timestamp format, yes/no query framing.
+
+    Schema (from HF API + arXiv:2501.05510 + GitHub README):
+    - Format: WebDataset (tar shards); HF siblings are chunked_videos.tar.part* +
+      src_videos.tar.part* (no Parquet rows).
+    - Annotation JSON (in repo or loaded via metadata): list of dicts with:
+        video_id     : str  (matches <video_id>.mp4 in chunked_videos/)
+        question_id  : str/int
+        timestamp    : float  (seconds; model is queried at this point)
+        question     : str
+        options      : list[str]  (MCQ, e.g. ["A. ...", "B. ...", ...])
+        answer       : str  (correct option letter or text)
+        category     : str  ("Real-Time Visual Perception" | "Backward Tracing" |
+                             "Forward Active Responding")
+        evidence_interval : [float, float]  (optional)
+    - We load only rows where category == "Real-Time Visual Perception".
+    - Binary label: MCQ questions with option matching 'yes'/'present'/'occur' -> 1,
+      'no'/'absent'/'not' -> 0; otherwise 1 (hazard/event present at timestamp).
+    - video dict: onset_s = timestamp (query point), fps=3 (OVO-Bench default).
     """
-    _stub("ovo_bench_rt",
-          "RT subset definition, timestamps, query format, license")
+    import io
+
+    vid_dir = out_dir / "videos"
+    vid_dir.mkdir(exist_ok=True)
+    samples: list["Sample"] = []
+
+    RT_CATEGORY = "Real-Time Visual Perception"
+    _YES_KEYWORDS = {"yes", "present", "occur", "happen", "appear", "shown", "visible"}
+    _NO_KEYWORDS = {"no", "absent", "not", "none", "never", "disappear"}
+
+    def _answer_to_label(answer: str, options: list) -> int:
+        """Map MCQ answer to binary label (1=event present, 0=absent)."""
+        ans_lower = answer.strip().lower()
+        # Check answer text directly
+        if any(kw in ans_lower for kw in _YES_KEYWORDS):
+            return 1
+        if any(kw in ans_lower for kw in _NO_KEYWORDS):
+            return 0
+        # Try to resolve via option letter (A/B/C/D)
+        if len(ans_lower) == 1 and options:
+            letter = ans_lower.upper()
+            for opt in options:
+                if opt.startswith(letter + ".") or opt.startswith(letter + " "):
+                    opt_text = opt[2:].strip().lower()
+                    if any(kw in opt_text for kw in _YES_KEYWORDS):
+                        return 1
+                    if any(kw in opt_text for kw in _NO_KEYWORDS):
+                        return 0
+        # Default: treat as event-present
+        return 1
+
+    # The HF dataset for OVO-Bench is a WebDataset (tar format).
+    # When loaded via load_dataset it may expose samples as dicts with
+    # '__key__', 'mp4' (bytes), '__url__', and metadata JSON.
+    # Try each known split; fall back to iterating all.
+    available_splits = list(ds.keys())
+    for split_name in available_splits:
+        split_data = ds[split_name]
+        for i, row in enumerate(split_data):
+            # WebDataset row: {'__key__': '...', 'mp4': bytes, '__url__': '...',
+            #                  'json': bytes-or-dict}  OR a flat annotation dict.
+            # Annotation may be stored in a 'json' key (WebDataset convention).
+            ann: dict = {}
+            json_field = row.get("json") or row.get("annotation") or row.get("metadata")
+            if isinstance(json_field, (bytes, bytearray)):
+                try:
+                    ann = json.loads(json_field.decode())
+                except Exception:
+                    pass
+            elif isinstance(json_field, dict):
+                ann = json_field
+            elif isinstance(json_field, str):
+                try:
+                    ann = json.loads(json_field)
+                except Exception:
+                    pass
+
+            # If annotation dict is missing, try reading fields directly from row.
+            if not ann:
+                ann = {k: v for k, v in row.items()
+                       if k not in ("mp4", "__key__", "__url__", "json")}
+
+            category = str(ann.get("category") or ann.get("task_type") or "").strip()
+            # Filter to RT subset only
+            if category and category != RT_CATEGORY:
+                continue
+
+            sid = f"ovo_bench_rt_{i:05d}"
+            video_id = str(ann.get("video_id") or row.get("__key__") or sid)
+            timestamp = float(ann.get("timestamp") or ann.get("query_time") or 0.0)
+            question = str(ann.get("question") or
+                           "Is the described event occurring at this moment in the video?")
+            options: list = ann.get("options") or []
+            answer = str(ann.get("answer") or "")
+            evidence = ann.get("evidence_interval") or []
+
+            label = _answer_to_label(answer, options)
+
+            # Save video bytes
+            vid_path = vid_dir / f"{video_id}.mp4"
+            mp4_bytes = row.get("mp4")
+            if isinstance(mp4_bytes, (bytes, bytearray)) and not vid_path.exists():
+                vid_path.write_bytes(mp4_bytes)
+            elif not vid_path.exists():
+                vid_path = vid_dir / f"{sid}.mp4"  # fallback name
+
+            opts_str = " | ".join(str(o) for o in options) if options else ""
+            rule_text = question
+            if opts_str:
+                rule_text = f"{question}  Options: {opts_str}"
+
+            meta: dict = {
+                "source": "OVO-Bench",
+                "split": split_name,
+                "category": category or RT_CATEGORY,
+                "video_id": video_id,
+                "answer": answer,
+            }
+            if evidence:
+                meta["evidence_interval"] = evidence
+            if ann.get("question_id") is not None:
+                meta["question_id"] = str(ann["question_id"])
+
+            samples.append(Sample(
+                id=sid, bench="ovo_bench_rt", modality="video",
+                media=str(vid_path.as_posix()),
+                label=label,
+                cls="realtime_visual_perception",
+                rule_text=rule_text,
+                item=None,
+                facts={},
+                boxes=[],
+                video=dict(
+                    fps=3.0,
+                    duration_s=timestamp + 30.0,  # approximate; full video not always known
+                    onset_s=timestamp,
+                    end_s=timestamp + 1.0,
+                ),
+                meta=meta,
+            ))
+    return samples
 
 
 def adapter_construction_site10k(root="data"):

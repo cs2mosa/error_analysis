@@ -78,7 +78,7 @@ def _exit(cfg: dict):
 
 
 def _nec_ratio(cfg):
-    return float(cfg.get("necessity", {}).get("ratio", 0.5))
+    return float(cfg.get("necessity", {}).get("ratio", 0.25))
 
 
 def _cons(cfg):
@@ -132,6 +132,10 @@ def breakage(runs: pd.DataFrame, ids: list[str], arm) -> tuple[int, int]:
 
 
 # ----------------------------------------------------------------- explain_recover (FR-E-3/4)
+
+# Below this visual-necessity KL (nats) the corrects' margin barely moves under
+# the arm, so VN_err/VN_cor is a 0/0-style ratio; it must not be trusted.
+_VN_FLOOR = 1e-3
 
 def explain_recover(
     runs: pd.DataFrame,
@@ -220,7 +224,9 @@ def explain_necessity(runs: pd.DataFrame, c: Cluster, cfg: dict) -> dict:
         def _ratio(d, _arm=arm, _gated=gated, _cor_ids=c.cor_ids):
             vn_e = _vn(d, _gated, _arm)
             vn_c = _vn(d, _cor_ids, _arm)
-            return vn_e / max(vn_c, 1e-9)
+            if not np.isfinite(vn_c) or vn_c < _VN_FLOOR:
+                return np.nan       # corrects' visual necessity ~ 0: ratio undefined -> None
+            return vn_e / vn_c
         ci[arm] = boot_ci(_ratio, sub)
 
     # necessity = True when VN_err/VN_cor ≤ ratio for both arms (both CI upper bounds)
@@ -267,9 +273,13 @@ def explain_consistency(runs: pd.DataFrame, c: Cluster, cfg: dict) -> dict:
 
     lo, hi = boot_ci(_gap, sub)
     ok = f_e >= min_flip and f_e >= cons_ratio * max(f_par, 1e-9)
+    # Truth table (BUG-17 fix): True only with ok ∧ CI gap > 0; False only
+    # when NOT ok (too few flips, or the gap CI says errors flip no more than
+    # corrects); an ok=True evidence vector with a straddling CI stays None —
+    # it must never be reported as False.
     if ok and lo > 0:
         explained: bool | None = True
-    elif (not ok and f_e < min_flip) or hi <= 0:
+    elif not ok and (f_e < min_flip or hi <= 0):
         explained = False
     else:
         explained = None
@@ -462,6 +472,19 @@ IMPL: dict[str, str] = {
     "trigger-policy failure (H11)":      "trigger head / calibrated thresholds",
 }
 
+# Known-cause injection -> expected cause (design §5.8b, FR-V-1). Single source
+# of truth shared by run.validate and report (BUG-05 fix): every expected cause
+# is a SIG key except INJ.label, whose expectation is the unexplained bucket
+# itself (FR-V-2: any confident cause assigned to label noise is a false
+# attribution and must show up off-diagonal in the confusion matrix).
+INJ_EXPECTED: dict[str, str] = {
+    "INJ.small":   "pixel/token-budget limit (H1/H4)",
+    "INJ.clutter": "clutter/binding/context (H8/H5)",
+    "INJ.degrade": "input quality (H9)",
+    "INJ.lead":    "polarity/framing bias (H6/H7)",
+    "INJ.label":   "unexplained → next tier",
+}
+
 
 def decide(ev: dict) -> tuple[str, list[str]]:
     """Signature-table lookup (FR-E-5, C1).
@@ -490,18 +513,23 @@ def decide(ev: dict) -> tuple[str, list[str]]:
 
 # ----------------------------------------------------------------- cluster builder (FR-E-1)
 
-def _taxonomy_tags(err_df: pd.DataFrame, runs: pd.DataFrame) -> dict[str, list[str]]:
+def _taxonomy_tags(table: pd.DataFrame, runs: pd.DataFrame) -> dict[str, list[str]]:
     """FR-E-2: assign plan §5 failure types automatically from metadata.
+
+    Computed over the FULL table (errors AND corrects — BUG-16 fix): tag
+    clusters look up matched corrects sharing the tag, which was impossible
+    when tags were built for error ids only (every `tag:` cluster had
+    cor_ids == [] and degenerate error-vs-correct comparisons).
 
     Automatable rules (others require human/T3-T4 input):
       - type_2a_absence: vtype == 'absence'
       - type_6_polarity_flip: sample flips pred across POL group prompts
     """
-    tags: dict[str, list[str]] = {sid: [] for sid in err_df.sample_id}
+    tags: dict[str, list[str]] = {sid: [] for sid in table.sample_id}
 
     # Type 2a: absence violations (from sample metadata)
-    if "vtype" in err_df.columns:
-        for sid in err_df[err_df.vtype == "absence"].sample_id:
+    if "vtype" in table.columns:
+        for sid in table[table.vtype == "absence"].sample_id:
             if sid in tags:
                 tags[sid].append("type_2a_absence")
 
@@ -569,11 +597,23 @@ def build_clusters(
         eids = list(err_df[mask].sample_id)
         if not eids:
             return
-        idx = "sample_id" if "sample_id" in cor_df.columns else cor_df.index.name
-        cids = [i for i in cor_ids if all(
-            cor_df.set_index(idx).loc[i, col] == val
-            for col, val in pred.items() if col in cor_df.columns
-        )] if idx else []
+        # vectorised over the whole correct pool once (BUG-15 fix: the old
+        # per-id set_index().loc() lookup was O(n^2) and silently produced []
+        # when cor_df had no id column, leaving clusters with no matched
+        # corrects and no warning).
+        id_col = "sample_id" if "sample_id" in cor_df.columns else cor_df.index.name
+        if id_col:
+            cmask = pd.Series(True, index=cor_df.index)
+            for col, val in pred.items():
+                if col in cor_df.columns:
+                    cmask &= cor_df[col] == val
+            cids = list(cor_df.loc[cmask, id_col]) if id_col in cor_df.columns \
+                else list(cor_df.index[cmask])
+        else:
+            cids = []
+        if not cids:
+            print(f"[build_clusters] WARNING: cluster '{key}' has no matched corrects "
+                  "(under-powered error-vs-correct diagnostics, NFR-5)")
         hz, agr = _hz_flags(eids)
         clusters.append(Cluster(
             name=", ".join(f"{k}={v}" for k, v in sorted(pred.items())),
@@ -600,16 +640,19 @@ def build_clusters(
     if "vtype" in err_df.columns and (err_df.vtype == "latent_hazard").any():
         _add_slice_cluster({"vtype": "latent_hazard"})
 
-    # Taxonomy-tag clusters (FR-E-2)
-    tags = _taxonomy_tags(err_df, runs)
+    # Taxonomy-tag clusters (FR-E-2): tags computed over the FULL table so
+    # matched corrects sharing the tag exist (BUG-16 fix)
+    tags = _taxonomy_tags(table, runs)
     tag_groups: dict[str, list[str]] = {}
     for sid, ts in tags.items():
         for t in ts:
             tag_groups.setdefault(t, []).append(sid)
-    for tag, eids in tag_groups.items():
+    err_set = set(err_df.sample_id)
+    for tag, tagged_ids in tag_groups.items():
+        eids = [i for i in tagged_ids if i in err_set]
         if len(eids) < min_support:
             continue
-        cids = [i for i in cor_ids if tags.get(i) and tag in tags[i]]
+        cids = [i for i in tagged_ids if i not in err_set]
         clusters.append(Cluster(name=f"tag:{tag}", err_ids=eids, cor_ids=cids, tag=tag))
 
     return clusters
@@ -768,6 +811,7 @@ def escalate(
     S: list,
     cfg: dict,
     out_dir: str | Path = "outputs/escalate",
+    external_diags: dict[str, dict] | None = None,
 ) -> tuple[list[Cluster], pd.DataFrame]:
     """Full escalation pipeline (FR-E-1..12).
 
@@ -779,6 +823,12 @@ def escalate(
       5. Call decide() to assign cause.
       6. Per-error accounting.
       7. Write clusters.json, diag_vector.parquet, audit_sample.csv.
+
+    external_diags: cluster name -> {diag: value} with the T3/T4 results
+    (loc, t4, causal) produced by `ea t3` / `ea t4` (BUG-03 fix: merged into
+    c.diags BEFORE decide() so SIG rows requiring them can finally match).
+    The `stream` diagnostic is computed here from the stored margin series
+    (offline trigger re-analysis, FR-ST-2 — no new model runs needed).
 
     Returns (clusters, diag_vector DataFrame).
     NFR-5: prints counts of skipped/underpowered clusters.
@@ -811,10 +861,33 @@ def escalate(
     clusters = build_clusters(et, matched_cor, runs, cfg)
     print(f"[escalate] {len(clusters)} clusters built")
 
+    # Merge T3/T4 diagnostics supplied by the attribution/mechanistic tiers
+    # (BUG-03 fix). Unknown cluster names are ignored so stale t3/t4 outputs
+    # from a different run cannot fabricate evidence.
+    if external_diags:
+        merged = 0
+        for c in clusters:
+            extra = external_diags.get(c.name)
+            if extra:
+                c.diags.update(extra)
+                merged += 1
+        print(f"[escalate] merged external T3/T4 diagnostics for {merged} clusters")
+
+    # `stream` diagnostic (H11, FR-ST-5): offline window-vs-stream re-analysis
+    # of the stored margin series — trigger policies never need new model runs.
+    # "policy" when the trigger policy (not perception) dominates the lateness.
+    from ea.stream import window_vs_stream_gap
+    gap = window_vs_stream_gap(runs, S, cfg, tau=0.0)
+    stream_diag = "policy" if gap.get("stream_policy") else False
+    if gap.get("n_risk_videos"):
+        print(f"[escalate] stream gap: window={gap.get('window_recall', 0):.2f} "
+              f"stream={gap.get('stream_recall', 0):.2f} policy={gap.get('stream_policy')}")
+
     # Step 4 + 5: diagnostics + decide
     underpowered = 0
     for c in clusters:
         run_diagnostics(c, runs, cfg)
+        c.diags.setdefault("stream", stream_diag)      # H11; external merge wins if present
         ev = {k: c.diags[k] for k in (
             "crop", "bgmask", "hires", "qr_ok", "sharpen", "knob",
             "qp_ok", "necessity", "consistency", "loc", "t4", "causal", "cue", "stream",

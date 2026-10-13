@@ -13,13 +13,29 @@ def load_cfg(path: str | None = None) -> dict:
     return yaml.safe_load(open(p, encoding="utf-8"))
 
 
-def model_ref(cfg) -> str:
-    """Resolve the model to load: explicit path > HF_HOME snapshot > name."""
+def model_ref(cfg, override=None) -> str:
+    """Resolve the model to load (BUG-12 fix: the single implementation).
+
+    Precedence: explicit override > MODEL_PATH env > cfg.model.path (if it
+    exists) > $HF_HOME snapshot of cfg.model.name > the repo name itself.
+    cli.py and selfcheck.py both import this; the duplicate _model_ref in
+    selfcheck.py was removed."""
     import os
-    if cfg["model"].get("path") and Path(cfg["model"]["path"]).exists():
-        return cfg["model"]["path"]
-    name = cfg["model"]["name"]
-    local = Path(os.environ.get("HF_HOME", "")) / "hub" / f"models--{name.replace('/', '--')}"
+    if override:
+        return override
+    env_p = os.environ.get("MODEL_PATH")
+    if env_p:
+        ep = Path(env_p)
+        if ep.exists() or (not env_p.startswith("/") and not env_p.startswith(".")
+                           and ":" not in env_p):
+            return env_p
+    if cfg and cfg.get("model", {}).get("path"):
+        p = Path(cfg["model"]["path"])
+        if p.exists():
+            return str(p)
+    name = (cfg.get("model", {}).get("name") if cfg else None) or "Qwen/Qwen3-VL-4B-Instruct"
+    hf_home = Path(os.environ.get("HF_HOME", ""))
+    local = hf_home / "hub" / f"models--{name.replace('/', '--')}"
     if local.exists():
         snaps = sorted((local / "snapshots").glob("*"))
         if snaps:

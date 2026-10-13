@@ -172,8 +172,27 @@ def recovery_steps(S: np.ndarray | list[float], tau: float = 0.0, degrade_idx: i
 
 # ----------------------------------------------------------------- FR-ST-5 & FR-ST-7 profile / gap
 
+def _onset_end(v: dict, tol: float) -> tuple[float | None, float | None]:
+    """(onset, end) from a sample's video dict (BUG-10 fix).
+
+    end defaults to onset + tol. Both reads use `is not None` so a legitimate
+    onset of 0.0 survives (the old `if onset` treated it as 'no onset' and
+    crashed or mis-scored), and an explicit end_s=None falls back rather than
+    poisoning downstream <= comparisons."""
+    onset = v.get("onset_s")
+    end = v.get("end_s")
+    if onset is not None and end is None:
+        end = onset + tol
+    return onset, end
+
+
 def window_vs_stream_gap(runs_df: pd.DataFrame, samples: list, cfg: dict, tau: float = 0.0) -> dict:
-    """Compute window-level vs stream-level metric gap for H11 trigger-policy test (FR-ST-5)."""
+    """Compute window-level vs stream-level metric gap for H11 trigger-policy test (FR-ST-5).
+
+    Both recalls are PER VIDEO (a video counts as a window hit if any stored
+    step inside [onset, end] exceeds tau) — BUG-10 fix: window recall
+    previously pooled per-timestep hits across all videos while stream recall
+    counted videos, so the gap compared unlike quantities."""
     st_cfg = cfg.get("stream", {})
     tol = float(st_cfg.get("tolerance_s", 2.0))
     k = int(st_cfg.get("k", 2))
@@ -181,27 +200,26 @@ def window_vs_stream_gap(runs_df: pd.DataFrame, samples: list, cfg: dict, tau: f
     ant = float(st_cfg.get("anticipation_s", 0.0))
 
     sample_map = {s.id: s for s in samples}
-    df = runs_df[runs_df.t.notna()].copy()
+    df = runs_df[runs_df.t.notna()].copy() if hasattr(runs_df, "t") else runs_df
     if df.empty:
-        return dict(window_recall=0.0, stream_recall=0.0, gap=0.0, stream_policy=False)
+        return dict(window_recall=0.0, stream_recall=0.0, gap=0.0, stream_policy=False,
+                    n_risk_videos=0, n_stream_videos=0)
 
     win_tp, win_fn = 0, 0
     for sid, group in df.groupby("sample_id"):
         s = sample_map.get(sid)
         if not s or s.modality != "video":
             continue
-        v = s.video or {}
-        onset = v.get("onset_s")
-        end = v.get("end_s", onset + tol if onset else None)
+        onset, end = _onset_end(s.video or {}, tol)
         if onset is None:
             continue
-        for _, row in group.iterrows():
-            t = float(row["t"])
-            if onset <= t <= end:
-                if row["s"] > tau:
-                    win_tp += 1
-                else:
-                    win_fn += 1
+        win_rows = group[(group.t >= onset) & (group.t <= end)]
+        if win_rows.empty:
+            continue
+        if (win_rows.s > tau).any():
+            win_tp += 1
+        else:
+            win_fn += 1
 
     win_recall = win_tp / max(1, win_tp + win_fn)
 
@@ -213,9 +231,7 @@ def window_vs_stream_gap(runs_df: pd.DataFrame, samples: list, cfg: dict, tau: f
         s = sample_map.get(sid)
         if not s or s.modality != "video":
             continue
-        v = s.video or {}
-        onset = v.get("onset_s")
-        end = v.get("end_s", onset + tol if onset else None)
+        onset, end = _onset_end(s.video or {}, tol)
         if onset is None:
             continue
         total_risk += 1
@@ -232,7 +248,8 @@ def window_vs_stream_gap(runs_df: pd.DataFrame, samples: list, cfg: dict, tau: f
 
     stream_recall = stream_tp / max(1, total_risk)
     gap = win_recall - stream_recall
-    policy_failure = bool(gap >= 0.2 or (policy_late_count / max(1, total_risk) >= 0.3))
+    policy_failure = bool(total_risk > 0 and
+                          (gap >= 0.2 or policy_late_count / max(1, total_risk) >= 0.3))
 
     return dict(
         window_recall=float(win_recall),
@@ -240,6 +257,8 @@ def window_vs_stream_gap(runs_df: pd.DataFrame, samples: list, cfg: dict, tau: f
         gap=float(gap),
         policy_late_rate=float(policy_late_count / max(1, total_risk)),
         stream_policy=policy_failure,
+        n_risk_videos=int(win_tp + win_fn),
+        n_stream_videos=int(total_risk),
     )
 
 
@@ -294,9 +313,7 @@ def evaluate_stream(runs_df: pd.DataFrame, samples: list, cfg: dict,
         s = sample_map.get(sid)
         if not s:
             continue
-        v = s.video or {}
-        onset = v.get("onset_s")
-        end = v.get("end_s", onset + tol if onset else None)
+        onset, end = _onset_end(s.video or {}, tol)
         group = group.sort_values("t")
         ts = group["t"].to_numpy()
         S_vals = group["s"].to_numpy()

@@ -47,6 +47,7 @@ class VLM:
             quantization_config=qc, attn_implementation=attn).eval()   # [VERIFY] dtype= (5.x renamed torch_dtype)
         self.p = AutoProcessor.from_pretrained(name)
         self.attn = attn
+        self._ids_cache: dict[tuple, list[int]] = {}
         if max_pixels or min_pixels:                        # FR-M-4 knob: resolution
             self.set_pixels(min_pixels, max_pixels)
 
@@ -72,12 +73,17 @@ class VLM:
 
     # ------------------------------------------------------------ answer ids (FR-M-2)
 
-    @lru_cache(None)
     def ids(self, words):
-        """Single-token ids for answer-word variants; drop multi-token, raise if empty."""
+        """Single-token ids for answer-word variants; drop multi-token, raise if empty.
+        Instance cache (BUG-20 fix): avoids keeping self alive in global lru_cache."""
+        key = tuple(words)
+        if key in self._ids_cache:
+            return self._ids_cache[key]
         out = {t[0] for w in words if len(t := self.p.tokenizer.encode(w, add_special_tokens=False)) == 1}
         assert out, f"no single-token variant for {words}"
-        return sorted(out)
+        res = sorted(out)
+        self._ids_cache[key] = res
+        return res
 
     def _s(self, lg, pos, neg):
         """Margin s = logsumexp(logit[pos]) - logsumexp(logit[neg]) (§6.1)."""
@@ -209,30 +215,41 @@ def per_token(site, x, n_vis):
 
 
 class KO:
-    """Global state read by knockout pre-hook."""
-    layers, blocks = set(), []
+    """Historical container for knockout metadata; kept for backwards compatibility."""
+    layers: set = set()
+    blocks: list = []
 
 
 @contextmanager
 def knockout(vlm, inp, spec, layers):
-    """Knockout attention paths between groups (spec) across layers (FR-M-8)."""
+    """Knockout attention paths between groups (spec) across layers (FR-M-8).
+    Re-entrant (BUG-20 fix): closure variables per context invocation, no global clobbering."""
     g = vlm.groups(inp)
-    KO.layers = set(layers)
-    KO.blocks = [(g[a], g[b]) for a, b in spec]
+    target_layers = set(layers)
+    blocks = [(g[a], g[b]) for a, b in spec]
     hk = []
     m = getattr(vlm.m, "model", vlm.m)
     lm = getattr(m, "language_model", m)
     layers_list = getattr(lm, "layers", [])
     for i, L in enumerate(layers_list):
         def pre(mod, args, kwargs, i=i):
-            if i not in KO.layers:
+            if i not in target_layers:
                 return
             mask = kwargs.get("attention_mask")
             if mask is None:
-                return
+                # BUG-07 fix: a silent return would make the knockout a no-op
+                # and report a fake "no causal role" effect of exactly zero.
+                raise RuntimeError(
+                    "knockout: self-attention received attention_mask=None "
+                    "(sdpa path?). Load the model with attn='eager' for "
+                    "knockout/horizon/knock_effect — a silent no-op must never "
+                    "be mistaken for 'no causal effect' (FR-M-8, selfcheck 6).")
+            if mask.dim() != 4:
+                raise RuntimeError(f"knockout: expected a 4-D attention mask, "
+                                   f"got {mask.dim()}-D (attn='eager' required)")
             mask = mask.clone()
             neg = torch.finfo(mask.dtype).min if mask.dtype.is_floating_point else False
-            for frm, to in KO.blocks:
+            for frm, to in blocks:
                 mask[:, :, to[:, None], frm[None, :]] = neg
             kwargs["attention_mask"] = mask
             return args, kwargs
@@ -243,11 +260,16 @@ def knockout(vlm, inp, spec, layers):
     finally:
         for h in hk:
             h.remove()
-        KO.layers, KO.blocks = set(), []
 
 
 def attn_last(vlm, inp):
     """Last-token attention row per layer -> [layers, heads, T_all] (FR-M-9)."""
+    if getattr(vlm, "attn", "eager") != "eager":
+        # BUG-08 fix: under sdpa the attention module returns o[1] = None;
+        # fail with the fix in the message instead of a TypeError deep inside.
+        raise ValueError("attn_last requires an eager-attention model instance "
+                         "(VLM(..., attn='eager')); sdpa does not materialize "
+                         "attention weights")
     out, hk = {}, []
     m = getattr(vlm.m, "model", vlm.m)
     lm = getattr(m, "language_model", m)

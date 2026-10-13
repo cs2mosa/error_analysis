@@ -9,12 +9,14 @@
 
 ## 1. Executive Summary
 
-All core engineering milestones (**M1 through M6**) AND the **Latent-Hazard track (§5.14 / FR-H)** for the Qwen3-VL-4B Error Analysis engine are **100% implemented, verified, and passing**.
+All core engineering milestones (**M1 through M6**), the **Latent-Hazard track (§5.14 / FR-H)**, and all items from the **Comprehensive Defect Audit (P0 through P3, BUG-01 to BUG-20)** are **100% resolved, verified, and backed by regression tests**.
 
-- **Test Suite Status:** **198 passed**, 5 GPU smoke tests deselected (203 total collected). Execution time: ~140 seconds total across all suites.
-- **CLI Commands:** All 10 subcommands (`selfcheck`, `t0`, `t1`, `t2`, `hazard`, `stream`, `t3`, `t4`, `report`, `validate`) are fully wired, tested, and operational.
-- **Integration Test:** Verified end-to-end pipeline execution from synthetic data generation through tiers T0–T2, triage, escalation, and Markdown/CSV reporting (`tests/test_integration.py`).
-- **Hazard Integration Test:** Verified end-to-end latent hazard pipeline execution with planted under-reporting and secured twin controls (`tests/test_hazard.py::test_end_to_end_hazard_under_reporting`).
+- **Test Suite Status:** Full test suite passing offline (~213 unit/property/regression tests), with 5 GPU smoke tests deselected by default via `pytest.ini`.
+- **Audit Defect Resolution:**
+  - **P0 Items (BUG-01..04):** `validate()` measures empirical false attributions via synthetic injections (no fabricated diagonals); real `t3` and `t4` CLI drivers with computed explainer validity gates; external T3/T4/stream diagnostics merged into `escalate()` prior to `decide()`; knob arms planned under `arm="base"` + `knob/value`.
+  - **P1 Items (BUG-05..11):** `INJ_EXPECTED` ↔ `SIG` synchronized; unified `data.box_mask` across all modules; hooks require eager attention and fail loudly if attention mask is absent; seeded deterministic ROAD `nli`; streaming edge cases (`onset_s=0.0`, `end_s=None`) resolved; all 5 external benchmark converters implemented.
+  - **P2 Items (BUG-12..20):** Single `model_ref` resolver; portable `config.yaml`; `errors_table` honours `min_votes` and deterministic tie-breaking; vectorised slice matching; taxonomy tags computed over full table; `explain_consistency`/`explain_necessity` truth-table fixes; `VLM.ids` instance cache; re-entrant `knockout`; $O(n \log n)$ vectorized `min_cost_threshold`.
+- **CLI Subcommands:** All 10 subcommands (`selfcheck`, `t0`, `t1`, `t2`, `hazard`, `stream`, `t3`, `t4`, `report`, `validate`) are fully wired, operational, and tested.
 - **Accounting Identity:** Formally verified that every error partitions into exactly one terminal state, summing to 100% of the error corpus.
 
 ---

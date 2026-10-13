@@ -23,7 +23,7 @@ from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold, cross
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from ea.attrib import box_mask
+from ea.data import box_mask
 
 
 # ----------------------------------------------------------------- FR-T4-1 feature caching
@@ -63,6 +63,43 @@ def cache_sample(vlm, s, prompt_text: str, box: list[float] | tuple[float, ...],
         f[f"L{i}_q"] = h[0, g["q"]].mean(0)
 
     np.savez(out_dir / f"{s.id}.npz", **{k: v.float().cpu().numpy().astype(np.float16) for k, v in f.items()})
+
+
+# ----------------------------------------------------------------- FR-T4-3 vision-only ceiling
+
+_DINO = {"m": None}
+
+
+def dinov2_pool(img: "Image.Image", box: list[float], out_dim: int = 768) -> np.ndarray | None:
+    """DINOv2 encoder-ceiling probe features (FR-T4-3): mean patch-token vector
+    inside the box on the DINOv2 patch grid (patch 14). Returns None (counted
+    skip by the caller) when the weights are unavailable offline."""
+    import zlib
+    import torch
+    from PIL import Image as I
+    if _DINO["m"] is None:
+        try:
+            from transformers import AutoModel
+            _DINO["m"] = AutoModel.from_pretrained("facebook/dinov2-base")
+        except Exception as e:
+            print(f"[mech] dinov2 unavailable (offline?): {e!r} — encoder-ceiling "
+                  "probe skipped and counted (NFR-5)")
+            _DINO["m"] = False
+    if _DINO["m"] is False:
+        return None
+    m = _DINO["m"].eval()
+    w, h = img.size
+    s = max(14, min(518, (min(w, h) // 14) * 14))
+    im = img.convert("RGB").resize((s, s))
+    with torch.no_grad():
+        pt = m(torch.from_numpy(np.asarray(im)).permute(2, 0, 1)[None].float()).last_hidden_state[0]
+    gh = gw = s // 14
+    x0, y0, x1, y1 = box
+    mm = np.zeros((gh, gw), bool)
+    mm[int(np.floor(y0 * gh)):max(int(np.ceil(y1 * gh)), int(np.floor(y0 * gh)) + 1),
+       int(np.floor(x0 * gw)):max(int(np.ceil(x1 * gw)), int(np.floor(x0 * gw)) + 1)] = True
+    pooled = pt.reshape(gh, gw, -1)[mm].mean(0)
+    return pooled.numpy().astype(np.float32)
 
 
 # ----------------------------------------------------------------- FR-T4-2 & FR-T4-3 probes

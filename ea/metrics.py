@@ -83,9 +83,28 @@ def expected_cost(pred, y, cm, cf):
 
 
 def min_cost_threshold(s, y, cm, cf):
-    """Threshold minimizing the expected cost (FR-B-3)."""
+    """Threshold minimizing the expected cost (FR-B-3).
+    Vectorized O(n log n) sweep for large arrays (BUG-20 fix)."""
     s = np.asarray(s, float)
-    return min((expected_cost((s > t).astype(int), y, cm, cf), float(t)) for t in np.unique(s))
+    y = np.asarray(y, int)
+    if len(s) == 0:
+        return 0.0, 0.0
+    u_thresh = np.unique(s)
+    if len(u_thresh) <= 200:
+        return min((expected_cost((s > t).astype(int), y, cm, cf), float(t)) for t in u_thresh)
+    order = np.argsort(s)
+    s_sorted = s[order]
+    y_sorted = y[order]
+    n_pos = int((y == 1).sum())
+    n = len(y)
+    idx_right = np.searchsorted(s_sorted, u_thresh, side="right") - 1
+    cum_pos = np.cumsum(y_sorted == 1)
+    cum_neg = np.cumsum(y_sorted == 0)
+    misses = cum_pos[idx_right]
+    false_alarms = (n - n_pos) - cum_neg[idx_right]
+    costs = (cm * misses + cf * false_alarms) / n
+    best_i = int(np.argmin(costs))
+    return float(costs[best_i]), float(u_thresh[best_i])
 
 
 # ------------------------------------------------------------ pairs (FR-B-5)

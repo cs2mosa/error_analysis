@@ -223,3 +223,137 @@ def test_cli_load_samples_auto_resolves_and_persists(tmp_path, monkeypatch):
     S2 = _load_samples(str(d), cfg={})
     assert len(S2) == 200
     assert S2[0].id == S[0].id
+
+
+# ---------------------------------------------------------------- Converter unit tests (mock datasets)
+
+def test_convert_cs10k_mock(tmp_path):
+    from ea.data import _convert_cs10k
+    im = Image.new("RGB", (64, 64), color="red")
+    mock_ds = {
+        "test": [
+            {
+                "image": im,
+                "question": "Is the worker wearing PPE?",
+                "answer": "Safety violation: worker is not wearing helmet.",
+                "bboxes": [[0.1, 0.2, 0.8, 0.9]],
+            },
+            {
+                "image": im,
+                "question": "Is safety gear worn?",
+                "answer": "Compliant and safe.",
+                "bboxes": [],
+            },
+        ]
+    }
+    out_dir = tmp_path / "cs10k_out"
+    samples = _convert_cs10k(mock_ds, out_dir)
+    assert len(samples) == 2
+    assert samples[0].label == 1
+    assert samples[0].bench == "cs10k"
+    assert samples[0].modality == "image"
+    assert len(samples[0].boxes) == 1
+    assert samples[0].boxes[0]["xyxy"] == [0.2, 0.1, 0.9, 0.8]
+    assert samples[1].label == 0
+    assert Path(samples[0].media).exists()
+
+
+def test_convert_isafetybench_mock(tmp_path):
+    from ea.data import _convert_isafetybench
+    mock_ds = {
+        "train": [
+            {
+                "video": {"path": "hazard/clip_01.mp4", "bytes": b"fake_mp4_bytes_1"},
+                "label": 1,
+                "action": "spill hazard",
+            },
+            {
+                "video": {"path": "normal/clip_02.mp4", "bytes": b"fake_mp4_bytes_2"},
+                "label": 0,
+                "action": "walking normally",
+            },
+        ]
+    }
+    out_dir = tmp_path / "isafety_out"
+    samples = _convert_isafetybench(mock_ds, out_dir)
+    assert len(samples) == 2
+    assert samples[0].label == 1
+    assert samples[0].cls == "industrial_hazard"
+    assert samples[0].video["duration_s"] == 6.0
+    assert samples[1].label == 0
+    assert samples[1].cls == "industrial_normal"
+    assert Path(samples[0].media).exists()
+    assert Path(samples[0].media).read_bytes() == b"fake_mp4_bytes_1"
+
+
+def test_convert_fieldworkarena_mock(tmp_path):
+    from ea.data import _convert_fieldworkarena
+    im = Image.new("RGB", (32, 32), color="blue")
+    mock_ds = {
+        "test": [
+            {
+                "image": im,
+                "question": "Check worker safety",
+                "answer": "There is an unsafe ladder placement.",
+                "task_type": "hazard_detection",
+            },
+            {
+                "video": b"fake_video_stream",
+                "question": "Is procedure correct?",
+                "is_violation": False,
+                "task_type": "procedure_verification",
+                "fps": 10.0,
+                "duration": 5.0,
+            },
+        ]
+    }
+    out_dir = tmp_path / "fwa_out"
+    samples = _convert_fieldworkarena(mock_ds, out_dir)
+    assert len(samples) == 2
+    assert samples[0].modality == "image"
+    assert samples[0].label == 1
+    assert Path(samples[0].media).exists()
+    assert samples[1].modality == "video"
+    assert samples[1].label == 0
+    assert samples[1].video["fps"] == 10.0
+    assert Path(samples[1].media).exists()
+
+
+def test_convert_ovo_bench_rt_mock(tmp_path):
+    from ea.data import _convert_ovo_bench_rt
+    mock_ds = {
+        "train": [
+            {
+                "__key__": "vid_123",
+                "mp4": b"fake_video_bytes",
+                "json": json.dumps({
+                    "video_id": "vid_123",
+                    "question_id": 42,
+                    "timestamp": 12.5,
+                    "category": "Real-Time Visual Perception",
+                    "question": "Is an accident happening?",
+                    "options": ["A. Yes", "B. No"],
+                    "answer": "A",
+                }),
+            },
+            {
+                "__key__": "vid_999",
+                "mp4": b"fake_video_bytes_2",
+                "json": json.dumps({
+                    "video_id": "vid_999",
+                    "category": "Backward Tracing",  # should be filtered out
+                    "question": "What happened 5 seconds ago?",
+                    "answer": "Nothing",
+                }),
+            },
+        ]
+    }
+    out_dir = tmp_path / "ovo_out"
+    samples = _convert_ovo_bench_rt(mock_ds, out_dir)
+    assert len(samples) == 1
+    assert samples[0].id == "ovo_bench_rt_00000"
+    assert samples[0].label == 1
+    assert samples[0].video["onset_s"] == 12.5
+    assert samples[0].video["fps"] == 3.0
+    assert Path(samples[0].media).exists()
+
