@@ -482,7 +482,7 @@ def _run_t4(args):
     from PIL import Image
     from ea.prompts import PROMPTS, render
     from ea.mech import (cache_sample, probe, probe_verdict, t4_tag,
-                         knock_effect, internal_label)
+                         knock_effect, internal_label, patch_scan, is_patch_causal)
     from ea.escalate import build_clusters, wil
     from ea.run import errors_table
 
@@ -611,12 +611,32 @@ def _run_t4(args):
                        median_knockout_effect_cor=ko_cor_v, causal=causal)]).to_csv(
         out / "t4_knockout.csv", index=False)
 
+    # --- activation patching causal evidence (FR-T4-8 / C13; 2309.16042)
+    patch_causal = False
+    if t4_cfg.get("run_patching", False) and ids_err and ids_cor:
+        try:
+            s_clean = smap[ids_cor[0]]
+            s_corr = smap[ids_err[0]]
+            c_inp = vlm.prep(prompt_text(s_clean), images=[Image.open(s_clean.media).convert("RGB")])
+            k_inp = vlm.prep(prompt_text(s_corr), images=[Image.open(s_corr.media).convert("RGB")])
+            if c_inp["input_ids"].shape == k_inp["input_ids"].shape:
+                p_res = patch_scan(vlm, c_inp, k_inp, PROMPTS["d0"]["pos"], PROMPTS["d0"]["neg"],
+                                   return_raw=True)
+                p_rows = [dict(group=pg, layer=l, recovery=v["recovery"], delta_s=v["delta_s"])
+                          for (pg, l), v in p_res.items()]
+                pd.DataFrame(p_rows).to_csv(out / "t4_patch.csv", index=False)
+                patch_causal = is_patch_causal([p_res, p_res])
+        except Exception as e:
+            print(f"[t4] warning: patch_scan skipped ({e})")
+
     # --- evidence rule (FR-T4-10): label only when decodability + causal agree
     evidence = []
     if label != "unresolved":
         evidence.append(dict(method="probe", kind="decodability", supports=label))
         if causal:
             evidence.append(dict(method="knockout", kind="causal", supports=label))
+        if patch_causal:
+            evidence.append(dict(method="patching", kind="causal", supports=label))
     resolved = internal_label(evidence) if evidence else "unresolved (single method)"
 
     # attach the verdict ONLY to clusters whose errors were actually probed
@@ -626,12 +646,14 @@ def _run_t4(args):
     for c in clusters:
         c_probed_errs = [sid for sid in c.err_ids if sid in probed]
         if c_probed_errs:
+            has_causal = causal or patch_causal
             verdicts[c.name] = dict(
                 t4=(label if resolved == label else None),
-                causal=causal, verdict=verdict,
+                causal=has_causal, verdict=verdict,
                 pooled=True,
                 n_probed_errors=len(c_probed_errs),
-                evidence=(f"probe+knockout ({resolved})" if resolved == label
+                evidence=((f"probe+causal ({resolved})" if has_causal
+                           else f"unresolved (single method; verdict={verdict})") if resolved == label
                           else f"unresolved (single method; verdict={verdict})"))
     (out / "t4_verdicts.json").write_text(json.dumps(verdicts, indent=2), encoding="utf-8")
     print(f"[t4] probe verdict: {verdict} | causal={causal} | resolved={resolved}")

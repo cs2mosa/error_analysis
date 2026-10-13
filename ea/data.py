@@ -81,6 +81,7 @@ _BENCH_REGISTRY: dict[str, tuple[str, str]] = {
     "fieldworkarena":("Fujitsu/FieldWorkArena_Dataset",   "_convert_fieldworkarena"),
     "pasbench":     ("beingbetter11643/PaSBench-Video",   "_convert_pasbench"),
     "ovo_bench_rt": ("JoeLeelyf/OVO-Bench",               "_convert_ovo_bench_rt"),
+    "safebuild":    ("peter23333/SafeBuild-Bench",           "_convert_safebuild"),
     "toy":          (None,                                 None),  # synthetic
 }
 
@@ -566,15 +567,19 @@ def _probe_video(path: Path | str, default_fps: float = 8.0,
 def _convert_cs10k(ds, out_dir: Path) -> list["Sample"]:
     """ConstructionSite10k (HF: LouisChen15/ConstructionSite) -> list[Sample].
 
-    Schema mapping (from Parquet inspection of the HF dataset):
-    - Uses the 'test' split (3,004 rows) for benchmarking.
-    - 'image' column: PIL Image.
-    - 'answer' column: free-form text; presence of safety-negative keywords -> label=1.
-    - 'question' column: used as rule_text.
-    - bounding boxes: stored as [ymin, xmin, ymax, xmax] normalized; re-ordered to xyxy.
-    [VERIFY] Parquet schema, bbox field names, label extraction heuristic.
+    Real HF schema (confirmed from Parquet siblings + Croissant metadata):
+      image          : PIL Image
+      image_id       : str
+      image_caption  : str
+      rule_1_violation .. rule_4_violation : struct {
+          bounding_box : Sequence[Sequence[float64]]  # [[ymin, xmin, ymax, xmax]]
+          reason       : str
+      }
+      excavator, rebar, worker_with_white_hard_hat : Sequence[Sequence[float]]  (object boxes)
+    Label: any rule_N_violation.reason that is non-empty -> label=1 (violation present).
+    Rule text: concatenated reason strings for all violated rules.
+    Boxes: rule_N_violation.bounding_box entries, converted from [ymin,xmin,ymax,xmax] to xyxy.
     """
-    import hashlib
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     split = "test" if "test" in ds else next(iter(ds))
@@ -583,48 +588,51 @@ def _convert_cs10k(ds, out_dir: Path) -> list["Sample"]:
     img_dir = out_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
 
-    _NEG_KEYWORDS = {
-        "violation", "missing", "not wearing", "no helmet", "no vest",
-        "unsafe", "hazard", "danger", "absent", "without",
-    }
+    _RULE_KEYS = ["rule_1_violation", "rule_2_violation", "rule_3_violation", "rule_4_violation"]
 
     for i, row in enumerate(rows):
-        # Save image
         img = _extract_image(row.get("image") or row.get("img"))
         if img is None:
             continue
-        sid = f"cs10k_{i:05d}"
+        sid = str(row.get("image_id") or f"cs10k_{i:05d}")
         img_path = img_dir / f"{sid}.jpg"
         if not img_path.exists():
             img.convert("RGB").save(img_path, quality=90)
 
-        # Derive label from answer text heuristic
-        answer_raw = str(row.get("answer") or row.get("caption") or "")
-        answer_lower = answer_raw.lower()
-        label = int(any(kw in answer_lower for kw in _NEG_KEYWORDS))
-
-        # Rule text from question field
-        rule_text = str(row.get("question") or "Workers must follow construction site safety rules.")
-
-        # Bounding boxes: [ymin,xmin,ymax,xmax] -> xyxy
+        # Collect violations from rule_N_violation structs.
         boxes = []
-        raw_boxes = row.get("bboxes") or row.get("bbox") or []
-        if isinstance(raw_boxes, list):
-            for b in raw_boxes:
-                if isinstance(b, (list, tuple)) and len(b) == 4:
-                    ymin, xmin, ymax, xmax = b
-                    boxes.append(dict(role="violator", xyxy=[xmin, ymin, xmax, ymax]))
+        reasons = []
+        for rk in _RULE_KEYS:
+            rv = row.get(rk)
+            if rv is None:
+                continue
+            # rv is a dict with 'bounding_box' (list of [ymin,xmin,ymax,xmax]) and 'reason' (str)
+            reason = str(rv.get("reason") or "").strip()
+            if reason:
+                reasons.append(reason)
+            bbs = rv.get("bounding_box") or []
+            if isinstance(bbs, (list, tuple)):
+                for bb in bbs:
+                    if isinstance(bb, (list, tuple)) and len(bb) == 4:
+                        ymin, xmin, ymax, xmax = bb
+                        boxes.append(dict(role="violator", xyxy=[xmin, ymin, xmax, ymax]))
+
+        label = 1 if reasons else 0
+        rule_text = " | ".join(reasons) if reasons else (
+            str(row.get("image_caption") or "Construction site safety evaluation.")
+        )
 
         samples.append(Sample(
             id=sid, bench="cs10k", modality="image",
             media=str(img_path.as_posix()),
             label=label,
             cls="rule_safety",
-            rule_text=rule_text,
+            rule_text=rule_text[:500],
             item=None,
             facts={},
             boxes=boxes,
-            meta={"source": "CS10K", "split": split, "answer_raw": answer_raw[:200]},
+            meta={"source": "CS10K", "split": split,
+                  "caption": str(row.get("image_caption") or "")[:200]},
         ))
     return samples
 
@@ -632,176 +640,365 @@ def _convert_cs10k(ds, out_dir: Path) -> list["Sample"]:
 def _convert_pasbench(ds, out_dir: Path) -> list["Sample"]:
     """PaSBench-Video (HF: beingbetter11643/PaSBench-Video) -> list[Sample].
 
-    Schema mapping:
-    - 'video' column: video bytes or path.
-    - 'label' column: 1 = risk, 0 = safe (or derived from category).
-    - 'onset_s' / 'risk_start' column: risk onset timestamp.
-    - 'end_s' / 'risk_end' column: risk end timestamp.
-    [VERIFY] Exact column names, video storage format, timestamp units.
+    Real HF layout (confirmed from siblings):
+      annotations/test_annotations.csv  — one row per video with columns:
+        file_name, sample_id, eval_split, risk_status, domain, dataset,
+        fps, num_frames, risk_start_frame, accident_frame,
+        risk_start_time_sec, accident_time_sec, warning_lead_time_sec,
+        risk_reason, recommended_user_action
+      test/videos/<domain>/<id>.avi     — raw video files
+    risk_status: 'risk' -> label=1, 'no_risk' -> label=0.
+    No-risk rows have no timing columns (NaN); they are kept as safe controls.
     """
+    import csv, io
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    split = "test" if "test" in ds else next(iter(ds))
-    rows = ds[split]
-    samples = []
-    skipped = 0
     vid_dir = out_dir / "videos"
     vid_dir.mkdir(parents=True, exist_ok=True)
+    samples = []
+    skipped = 0
 
-    for i, row in enumerate(rows):
-        sid = f"pasbench_{i:05d}"
+    # ---- locate the annotations CSV ----
+    # When loaded via load_dataset the CSV may be in ds as a split row, or the
+    # raw file can be read directly from the local clone directory.
+    ann_rows: list[dict] = []
+    csv_split = next((k for k in ds.keys() if "annotation" in k.lower()), None)
+    if csv_split:
+        # HF loaded the CSV as a dataset split (uncommon but possible)
+        ann_rows = list(ds[csv_split])
+    else:
+        # Try to read annotations/test_annotations.csv from the ds source path.
+        # When loaded from a local clone the ds object exposes cache_files.
+        try:
+            cache_files = ds[next(iter(ds.keys()))].cache_files
+            if cache_files:
+                src_root = Path(cache_files[0]["filename"]).parents[2]
+                csv_path = src_root / "annotations" / "test_annotations.csv"
+                if csv_path.exists():
+                    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+                        ann_rows = list(csv.DictReader(f))
+        except Exception:
+            pass
 
-        # Video: may be bytes, path string, or a dict with 'path'
-        video_data = row.get("video") or row.get("video_path")
-        if video_data is None:
-            continue
-        vid_path = vid_dir / f"{sid}.mp4"
-        if isinstance(video_data, (bytes, bytearray)) and not vid_path.exists():
-            vid_path.write_bytes(video_data)
-        elif isinstance(video_data, str):
-            vid_path = Path(video_data)
-        elif isinstance(video_data, dict):
-            raw_bytes = video_data.get("bytes")
-            if raw_bytes and not vid_path.exists():
-                vid_path.write_bytes(raw_bytes)
-            elif video_data.get("path"):
-                vid_path = Path(video_data["path"])
+    # Fallback: iterate the main split and try to parse rows as annotation dicts.
+    if not ann_rows:
+        main_split = "test" if "test" in ds else next(iter(ds))
+        for row in ds[main_split]:
+            if "file_name" in row or "sample_id" in row:
+                ann_rows.append(row)
 
-        label = int(row.get("label", row.get("risk", 1)))
-        # Risk onset is never defaulted to 0.0 (BUG-11 fix): a silent default
-        # corrupts every timing metric and compounds the falsy-0 onset bug in
-        # stream.py. Risk videos without onset/boundary are skipped, counted.
-        onset_raw = row.get("onset_s", row.get("risk_start"))
-        end_raw = row.get("end_s", row.get("risk_end"))
-        if onset_raw is None or end_raw is None:
-            if label == 1:
-                skipped += 1
-                continue
+    if not ann_rows:
+        print("[pasbench] WARNING: could not find annotations CSV; no samples produced.")
+        return []
+
+    for ann in ann_rows:
+        sid = str(ann.get("sample_id") or f"pasbench_{len(samples):05d}")
+        file_name = str(ann.get("file_name") or "")
+        risk_status = str(ann.get("risk_status") or "risk").lower()
+        label = 1 if risk_status == "risk" else 0
+        domain = str(ann.get("domain") or "")
+        fps_val = float(ann.get("fps") or 30.0)
+        num_frames = int(ann.get("num_frames") or 0)
+        duration_s = num_frames / fps_val if num_frames and fps_val else None
+
+        # Timing (only present for risk rows)
+        onset_raw = ann.get("risk_start_time_sec")
+        accident_raw = ann.get("accident_time_sec")
+        try:
+            onset_s = float(onset_raw) if onset_raw not in (None, "", "nan") else None
+            end_s   = float(accident_raw) if accident_raw not in (None, "", "nan") else None
+        except (TypeError, ValueError):
             onset_s = end_s = None
-        else:
-            onset_s = float(onset_raw)
-            end_s = float(end_raw)
-            if end_s < onset_s:
-                skipped += 1
-                continue
-        fps = float(row.get("fps", 8.0))
-        duration_s = float(row.get("duration_s") or ((end_s or 0.0) + 1.0))
+
+        if label == 1 and onset_s is None:
+            skipped += 1
+            continue
+        if onset_s is not None and end_s is not None and end_s < onset_s:
+            skipped += 1
+            continue
+
+        duration_s = duration_s or ((end_s or 0.0) + 1.0)
+
+        # Video path: resolve relative to clone root or use as-is
+        vid_path = vid_dir / f"{sid}.avi"
+        if file_name:
+            # file_name is like 'videos/DADA/images_1_002.avi'
+            possible = out_dir.parent / file_name
+            if possible.exists():
+                vid_path = possible
+
+        risk_reason = str(ann.get("risk_reason") or "")
+        rule_text = risk_reason[:500] if risk_reason else (
+            "Proactive safety: identify risk events before they escalate."
+        )
 
         samples.append(Sample(
             id=sid, bench="pasbench", modality="video",
             media=str(vid_path.as_posix()),
             label=label,
             cls="streaming_hazard",
-            rule_text="Proactive safety: identify risk events before they escalate.",
+            rule_text=rule_text,
             item=None,
             facts={},
             boxes=[],
-            video=dict(fps=fps, duration_s=duration_s, onset_s=onset_s, end_s=end_s),
-            meta={"source": "PaSBench-Video", "split": split,
-                  "category": str(row.get("category") or "")},
+            video=dict(fps=fps_val, duration_s=duration_s, onset_s=onset_s, end_s=end_s),
+            meta={"source": "PaSBench-Video", "split": "test",
+                  "domain": domain,
+                  "recommended_action": str(ann.get("recommended_user_action") or "")[:300]},
         ))
     if skipped:
-        print(f"[pasbench] skipped {skipped} risk videos without onset/boundary "
-              "timestamps (NFR-5: counted, never silently defaulted)")
+        print(f"[pasbench] skipped {skipped} risk videos without valid onset/boundary timestamps.")
     return samples
 
 
 def _convert_isafetybench(ds, out_dir: Path) -> list["Sample"]:
     """iSafetyBench (HF: raiyaanabdullah/isafety-bench) -> list[Sample].
 
-    Schema (from HF API + GitHub inspection):
-    - Splits: 'train' only (1,100 short industrial video clips, 4-8s each).
-    - File layout on HF: hazard/<video_id>.mp4  and  normal/<video_id>.mp4
-      The split is encoded in the filename prefix, not a dedicated column.
-    - HF dataset columns (Croissant): 'video' (VideoObject/bytes) + 'label' (integer).
-      When loaded via load_dataset the 'video' value is a dict with key 'path'
-      or raw bytes depending on the streaming mode.
-    - label integer: the dataset is multi-label (action ids), but for binary
-      hazard detection we map: any row coming from the hazard/ subtree -> 1,
-      normal/ subtree -> 0.  We detect this from the video path embedded in
-      the 'video' field or from the 'label' value (0 == normal by convention).
-    - cls: 'industrial_hazard' for hazard clips, 'industrial_normal' for safe.
-    - No bounding boxes or MCQ in this HF release; facts are empty.
+    Real layout (confirmed by user):
+      HF: raw mp4 files under hazard/<video_name>.mp4 and normal/<video_name>.mp4.
+          'video' field: {'path': 'hazard/<id>.mp4', 'bytes': ...}
+      GitHub annotations (https://github.com/iSafetyBench/data):
+          annotations_hazard.json: list of {video_name, caption, gt_actions: [str]}
+          (hazard clips only; normal clips have no annotation file)
+    Binary label: hazard/ path prefix -> 1, normal/ -> 0 (confirmed by user).
+    rule_text: caption from annotations_hazard.json if available, else generic prompt.
+    action_tag: gt_actions joined string; stored in meta.
+    """
+    import json as _json
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    vid_dir = out_dir / "videos"
+    vid_dir.mkdir(parents=True, exist_ok=True)
+    samples: list["Sample"] = []
+
+    # ---- Load annotations_hazard.json (hazard captions + gt_actions) ----
+    hazard_anns: dict[str, dict] = {}  # video_name -> {caption, gt_actions}
+    ann_candidates = [
+        out_dir.parent.parent / "isafetybench_raw" / "annotations_hazard.json",
+        out_dir.parent / "annotations_hazard.json",
+        Path("data/isafetybench_raw/annotations_hazard.json"),
+    ]
+    ann_loaded = False
+    for cand in ann_candidates:
+        if cand.exists():
+            with open(cand, encoding="utf-8") as f:
+                for entry in _json.load(f):
+                    hazard_anns[entry["video_name"]] = entry
+            ann_loaded = True
+            break
+    if not ann_loaded:
+        try:
+            import urllib.request
+            _ANN_URL = ("https://raw.githubusercontent.com/iSafetyBench/data"
+                        "/main/annotations_hazard.json")
+            with urllib.request.urlopen(_ANN_URL, timeout=15) as r:
+                for entry in _json.loads(r.read().decode()):
+                    hazard_anns[entry["video_name"]] = entry
+        except Exception:
+            pass  # labels still derived from path prefix
+
+    for split_name in ds.keys():
+        for i, row in enumerate(ds[split_name]):
+            sid = f"isafetybench_{i:05d}"
+
+            video_field = row.get("video") or row.get("video_path")
+            if video_field is None:
+                continue
+
+            vid_path = vid_dir / f"{sid}.mp4"
+            src_path_str = ""
+
+            if isinstance(video_field, dict):
+                src_path_str = str(video_field.get("path") or "")
+                raw_bytes = video_field.get("bytes")
+                if raw_bytes and not vid_path.exists():
+                    vid_path.write_bytes(raw_bytes)
+                elif src_path_str and not vid_path.exists():
+                    candidate = Path(src_path_str)
+                    if candidate.exists():
+                        vid_path = candidate
+            elif isinstance(video_field, (bytes, bytearray)):
+                if not vid_path.exists():
+                    vid_path.write_bytes(video_field)
+            elif isinstance(video_field, str):
+                src_path_str = video_field
+                vid_path = Path(video_field)
+
+            # Label from path prefix (confirmed by user)
+            path_lower = src_path_str.replace("\\", "/").lower()
+            if "hazard/" in path_lower:
+                is_hazard = True
+            elif "normal/" in path_lower:
+                is_hazard = False
+            else:
+                raw_lbl = row.get("label")
+                is_hazard = (int(raw_lbl) != 0) if raw_lbl is not None else False
+
+            label = 1 if is_hazard else 0
+            cls = "industrial_hazard" if is_hazard else "industrial_normal"
+
+            # Enrich from annotations_hazard.json
+            video_name = src_path_str.replace("\\", "/").split("/")[-1]
+            ann = hazard_anns.get(video_name, {})
+            caption = str(ann.get("caption") or "")
+            gt_actions: list[str] = list(ann.get("gt_actions") or [])
+
+            if caption:
+                rule_text = caption[:500]
+            elif is_hazard:
+                rule_text = "Industrial safety: identify hazardous or unsafe actions in the video."
+            else:
+                rule_text = "Industrial safety: confirm this clip shows routine, safe operations."
+
+            action_tag = ", ".join(gt_actions) if gt_actions else (
+                str(row.get("action") or row.get("action_label") or "").strip()
+            )
+
+            meta: dict = {
+                "source": "iSafetyBench",
+                "split": split_name,
+                "scene_type": "hazard" if is_hazard else "normal",
+                "timing_valid": False,
+            }
+            if action_tag:
+                meta["action_tag"] = action_tag
+            if gt_actions:
+                meta["gt_actions"] = gt_actions
+            if row.get("label") is not None:
+                meta["raw_label"] = int(row["label"])
+
+            fps_val, dur_val = _probe_video(
+                vid_path, default_fps=float(row.get("fps") or 8.0),
+                default_duration=float(row.get("duration_s") or row.get("duration") or 6.0)
+            )
+
+            samples.append(Sample(
+                id=sid, bench="isafetybench", modality="video",
+                media=str(vid_path.as_posix()),
+                label=label,
+                cls=cls,
+                rule_text=rule_text,
+                item=None,
+                facts={},
+                boxes=[],
+                video=dict(fps=fps_val, duration_s=dur_val, onset_s=None, end_s=None),
+                meta=meta,
+            ))
+    return samples
+
+
+def _convert_safebuild(ds, out_dir: Path) -> list["Sample"]:
+    """SafeBuild-Bench (HF: peter23333/SafeBuild-Bench) -> list[Sample].
+
+    Real schema (confirmed via datasets-server API, 3314 train rows):
+      image               : PIL Image
+      id                  : str
+      question            : str  (MCQ prompt)
+      options             : dict {A: str, B: str, C: str, D: str}
+      answer              : str  (correct letter)
+      task_type           : str  ('mc_hazard', 'free_form', ...)
+      gt_category_name_en : str  hazard category (English)
+      hazard_category_name: str  broader hazard class
+      hazard_desc         : str  description
+      judge_violation     : str  'yes'/'no'  <- primary label
+      regulation          : str  regulatory rule text
+      bboxes              : list[{x1,x2,y1,y2}]
+      num_bboxes          : int
+      benchmark_split     : str  ('val', 'test', ...)
+    Binary label: judge_violation == 'yes' -> 1, else 0.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     split = "train" if "train" in ds else next(iter(ds))
     rows = ds[split]
     samples = []
-    vid_dir = out_dir / "videos"
-    vid_dir.mkdir(parents=True, exist_ok=True)
+    img_dir = out_dir / "images"
+    img_dir.mkdir(parents=True, exist_ok=True)
 
     for i, row in enumerate(rows):
-        sid = f"isafetybench_{i:05d}"
-
-        # Video field: dict with 'path' key, or raw bytes, or a file-like object.
-        video_data = row.get("video") or row.get("video_path")
-        if video_data is None:
+        img = _extract_image(row.get("image") or row.get("img"))
+        if img is None:
             continue
 
-        vid_path = vid_dir / f"{sid}.mp4"
-        src_path_str = ""
-        if isinstance(video_data, dict):
-            src_path_str = str(video_data.get("path") or video_data.get("bytes") or "")
-            raw_bytes = video_data.get("bytes")
-            if raw_bytes and not vid_path.exists():
-                vid_path.write_bytes(raw_bytes)
-            elif video_data.get("path"):
-                vid_path = Path(video_data["path"])
-        elif isinstance(video_data, bytes) and not vid_path.exists():
-            vid_path.write_bytes(video_data)
-        elif isinstance(video_data, str):
-            src_path_str = video_data
-            vid_path = Path(video_data)
+        sid = str(row.get("id") or f"safebuild_{i:05d}")
+        img_path = img_dir / f"safebuild_{i:05d}.jpg"
+        if not img_path.exists():
+            try:
+                img.convert("RGB").save(img_path, quality=90)
+            except Exception:
+                pass
 
-        # Infer hazard/normal from file path prefix or label column.
-        # HF layout: hazard/<id>.mp4 vs normal/<id>.mp4.
-        raw_label = row.get("label")
-        if src_path_str:
-            is_hazard = "hazard" in src_path_str.replace("\\", "/").lower()
-        elif raw_label is not None:
-            # label=0 typically means 'normal' in this dataset's int mapping;
-            # any nonzero label encodes a hazardous action category index.
-            is_hazard = (int(raw_label) != 0)
+        # Label from judge_violation field
+        judge = str(row.get("judge_violation") or "").strip().lower()
+        if judge == "yes":
+            label = 1
+        elif judge == "no":
+            label = 0
         else:
-            is_hazard = False
+            cat = str(row.get("gt_category_name_en") or row.get("hazard_category_name") or "")
+            label = 0 if cat.strip().lower() in ("", "safe", "compliant", "normal") else 1
 
-        label = 1 if is_hazard else 0
-        cls = "industrial_hazard" if is_hazard else "industrial_normal"
-        rule_text = (
-            "Industrial safety: identify hazardous or unsafe actions in the video."
-            if is_hazard else
-            "Industrial safety: confirm this clip shows routine, safe operations."
+        cat_en = str(
+            row.get("gt_category_name_en") or
+            row.get("gt_category_name") or
+            row.get("hazard_category_name") or "unknown"
         )
+        cls = cat_en.strip().lower().replace(" ", "_") or "unknown"
 
-        action_tag = str(row.get("action") or row.get("action_label") or "").strip()
-        meta: dict = {
-            "source": "iSafetyBench",
-            "split": split,
-            "scene_type": "hazard" if is_hazard else "normal",
-            "timing_valid": False,  # NEW-05: onset timestamps not in benchmark
-        }
-        if action_tag:
-            meta["action_tag"] = action_tag
-        if raw_label is not None:
-            meta["raw_label"] = int(raw_label)
+        # rule_text: regulation > hazard_desc > question
+        regulation = str(row.get("regulation") or "").strip()
+        hazard_desc = str(row.get("hazard_desc") or "").strip()
+        question = str(row.get("question") or "Identify any safety hazards in this image.")
+        rule_text = (regulation or hazard_desc or question)[:500]
 
-        fps_val, dur_val = _probe_video(
-            vid_path, default_fps=float(row.get("fps") or 8.0),
-            default_duration=float(row.get("duration_s") or row.get("duration") or 6.0)
-        )
+        # options: real schema is dict {A,B,C,D}
+        options_raw = row.get("options") or {}
+        if isinstance(options_raw, dict):
+            options = options_raw
+        elif isinstance(options_raw, (list, tuple)):
+            options = {k: v for k, v in zip("ABCDE", options_raw)}
+        else:
+            options = {}
+
+        answer = str(row.get("answer") or "").strip()
+        task_type = str(row.get("task_type") or "mc_hazard")
+
+        facts: dict = {}
+        if options:
+            facts["options"] = options
+        if answer:
+            facts["answer"] = answer
+        if task_type:
+            facts["task_type"] = task_type
+        if regulation:
+            facts["regulation"] = regulation
+
+        # bboxes: list of {x1,x2,y1,y2}
+        boxes = []
+        for b in (row.get("bboxes") or []):
+            if isinstance(b, dict):
+                try:
+                    boxes.append({
+                        "x1": int(b["x1"]), "y1": int(b["y1"]),
+                        "x2": int(b["x2"]), "y2": int(b["y2"]),
+                    })
+                except (KeyError, ValueError):
+                    pass
+
+        bench_split = str(row.get("benchmark_split") or split)
 
         samples.append(Sample(
-            id=sid, bench="isafetybench", modality="video",
-            media=str(vid_path.as_posix()),
-            label=label,
-            cls=cls,
-            rule_text=rule_text,
-            item=None,
-            facts={},
-            boxes=[],
-            video=dict(fps=fps_val, duration_s=dur_val, onset_s=None, end_s=None),
-            meta=meta,
+            id=sid, bench="safebuild", modality="image",
+            media=str(img_path.as_posix()),
+            label=label, cls=cls, rule_text=rule_text,
+            item=None, facts=facts, boxes=boxes,
+            meta={
+                "source": "SafeBuild-Bench",
+                "split": bench_split,
+                "hazard_category": cat_en,
+                "judge_violation": judge,
+                "num_bboxes": int(row.get("num_bboxes") or len(boxes)),
+            },
         ))
     return samples
 
@@ -1148,11 +1345,15 @@ def adapter_ovo_bench_rt(root="data"):
 
 def adapter_safebuild_bench(root="data"):
     """SafeBuild-Bench -> samples.jsonl.
+
     Source: 'SafeBuild-Bench: Evaluating MLLMs on Industrial Construction Safety'
             (arXiv:2608.00068).
+    HF Hub: datasets.load_dataset('CSEdu-AI/SafeBuild-Bench')
     Scale:  3,314 task instances from 3,000+ expert-verified images via GEMS pipeline.
     Tasks:  Multiple-choice hazard identification, free-form hazard description.
-    [VERIFY] items: Mapping multiple-choice hazard categories into rule_text and cls;
-             mapping hazard present (1) vs safe compliant (0) into binary margin queries.
+    Implemented: _convert_safebuild (registered as 'safebuild' in _BENCH_REGISTRY).
+    [VERIFY] items: Confirm HF column names (image, category, question, options, answer,
+             task_type) against live Parquet schema before enabling production ingestion.
     """
-    _stub("safebuild_bench", "GEMS instance format, hazard identification mapping, license")
+    _stub("safebuild_bench", "HF column names, hazard category taxonomy, license")
+

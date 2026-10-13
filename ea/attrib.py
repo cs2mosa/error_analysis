@@ -146,15 +146,14 @@ def three_way(enr_err: list[float] | np.ndarray, enr_cor: list[float] | np.ndarr
 # ----------------------------------------------------------------- FR-T3-5 deletion / insertion
 
 def nli(img_arr: np.ndarray, mask: np.ndarray,
-        noise_std: float | None = None, seed: int | None = None) -> np.ndarray:
-    """Noisy Linear Imputation (ROAD, 2202.00449; design §5.9 [VERIFY] item 11).
+        noise_std: float | None = None, seed: int | None = None,
+        iters: int = 20) -> np.ndarray:
+    """Noisy Linear Imputation (ROAD, 2202.00449 §5.2; design §5.9 [VERIFY] item 11).
 
-    Each masked pixel is filled by LINEAR interpolation between the nearest
-    unmasked boundary pixels of its row (edge values extend flat runs at the
-    image border), then additive Gaussian noise calibrated to the unmasked
-    std is applied to the masked pixels only. This replaces the previous
-    nearest-neighbour fill, which is not the algorithm ROAD describes
-    (selfcheck item 11: verify against the authors' reference behaviour).
+    Bootstraps each masked pixel by linear interpolation between boundary pixels,
+    then solves the 2D harmonic inpainting stencil (w_d = 1/6 for orthogonal
+    neighbors, w_i = 1/12 for diagonal neighbors per ROAD Eq. 3-5). Additive
+    Gaussian noise calibrated to unmasked variance is applied to masked pixels.
 
     Determinism (BUG-09 fix): the noise RNG is seeded explicitly; the default
     seed derives from the image bytes, so the same image+mask always yields
@@ -194,6 +193,15 @@ def nli(img_arr: np.ndarray, mask: np.ndarray,
                     continue
                 kcols = idx_rows[known[:, col]]
                 ch[mcol, col] = np.interp(idx_rows[mcol], kcols, ch[kcols, col])
+
+        # ROAD 2D harmonic inpainting (2202.00449 §5.2): 8-neighbor stencil relaxation
+        for _ in range(iters):
+            padded = np.pad(ch, 1, mode="edge")
+            stencil = (1.0 / 6.0) * (padded[:-2, 1:-1] + padded[2:, 1:-1] +
+                                     padded[1:-1, :-2] + padded[1:-1, 2:]) + \
+                      (1.0 / 12.0) * (padded[:-2, :-2] + padded[:-2, 2:] +
+                                     padded[2:, :-2] + padded[2:, 2:])
+            ch[mask] = stencil[mask]
         out[:, :, c] = ch
 
     noise = rng.normal(0, max(1.0, std_val * 0.5), size=out.shape)
@@ -249,11 +257,13 @@ def del_ins(score_fn, img: Image.Image, amap: np.ndarray, mode: str = "del",
 # ----------------------------------------------------------------- FR-T3-6 Explainer gate
 
 def explainer_validity_gate(score_fn, img: Image.Image, amap: np.ndarray,
-                            steps: int = 5, sign: int = 1, seed: int = 0) -> dict:
+                            steps: int = 5, sign: int = 1, seed: int = 0,
+                            ko_fn: callable | None = None) -> dict:
     """Explainer-validity gate verifying deletion/insertion properties (FR-T3-6).
 
     seed controls both the random comparison map and the nli fill, so the
-    gate verdict is reproducible (BUG-09 fix; NFR-1)."""
+    gate verdict is reproducible (BUG-09 fix; NFR-1).
+    ko_fn: optional internal knockout evaluator checking internal agreement (FR-T3-6 e)."""
     amap = np.asarray(amap, dtype=float)
     rng = np.random.default_rng(seed)
     rand_map = rng.uniform(0, 1, size=amap.shape)
@@ -273,7 +283,18 @@ def explainer_validity_gate(score_fn, img: Image.Image, amap: np.ndarray,
     d_blur = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="blur", seed=seed)
     fill_stable = bool(abs(d_gray - d_blur) < 5.0)
 
-    valid = bool(del_beats_rand and ins_beats_rand and fill_stable)
+    # Internal agreement check (FR-T3-6 item e / arXiv:2509.04588)
+    internal_agreement = None
+    if ko_fn is not None:
+        flat_order = np.argsort(-amap.ravel())
+        top_k = flat_order[:max(1, len(flat_order) // 4)]
+        rand_k = rng.choice(len(flat_order), size=len(top_k), replace=False)
+        eff_top = float(ko_fn(top_k))
+        eff_rand = float(ko_fn(rand_k))
+        internal_agreement = bool(eff_top >= eff_rand)
+
+    valid = bool(del_beats_rand and ins_beats_rand and fill_stable and
+                 (internal_agreement is None or internal_agreement))
     return dict(
         valid=valid,
         del_expl=float(d_expl),
@@ -285,6 +306,7 @@ def explainer_validity_gate(score_fn, img: Image.Image, amap: np.ndarray,
         del_beats_rand=del_beats_rand,
         ins_beats_rand=ins_beats_rand,
         fill_stable=fill_stable,
+        internal_agreement=internal_agreement,
     )
 
 

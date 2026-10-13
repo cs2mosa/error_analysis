@@ -230,19 +230,30 @@ def test_cli_load_samples_auto_resolves_and_persists(tmp_path, monkeypatch):
 def test_convert_cs10k_mock(tmp_path):
     from ea.data import _convert_cs10k
     im = Image.new("RGB", (64, 64), color="red")
+    # Real HF schema: rule_N_violation is a dict with 'bounding_box' and 'reason'.
+    # bounding_box entries are [ymin, xmin, ymax, xmax]; converter reorders to xyxy.
     mock_ds = {
         "test": [
             {
                 "image": im,
-                "question": "Is the worker wearing PPE?",
-                "answer": "Safety violation: worker is not wearing helmet.",
-                "bboxes": [[0.1, 0.2, 0.8, 0.9]],
+                "image_id": "cs10k_test_001",
+                "image_caption": "Worker on scaffold without helmet.",
+                "rule_1_violation": {
+                    "bounding_box": [[0.1, 0.2, 0.8, 0.9]],   # ymin,xmin,ymax,xmax
+                    "reason": "Worker is not wearing a hard hat.",
+                },
+                "rule_2_violation": {"bounding_box": [], "reason": ""},
+                "rule_3_violation": None,
+                "rule_4_violation": None,
             },
             {
                 "image": im,
-                "question": "Is safety gear worn?",
-                "answer": "Compliant and safe.",
-                "bboxes": [],
+                "image_id": "cs10k_test_002",
+                "image_caption": "All workers wearing full PPE.",
+                "rule_1_violation": {"bounding_box": [], "reason": ""},
+                "rule_2_violation": {"bounding_box": [], "reason": ""},
+                "rule_3_violation": None,
+                "rule_4_violation": None,
             },
         ]
     }
@@ -253,9 +264,11 @@ def test_convert_cs10k_mock(tmp_path):
     assert samples[0].bench == "cs10k"
     assert samples[0].modality == "image"
     assert len(samples[0].boxes) == 1
+    # bounding_box [ymin=0.1, xmin=0.2, ymax=0.8, xmax=0.9] -> xyxy [x0,y0,x1,y1]
     assert samples[0].boxes[0]["xyxy"] == [0.2, 0.1, 0.9, 0.8]
     assert samples[1].label == 0
     assert Path(samples[0].media).exists()
+
 
 
 def test_convert_isafetybench_mock(tmp_path):

@@ -237,8 +237,10 @@ def horizon(vlm, inp, pos=("Yes",), neg=("No",), L: int = 36, frac: float = 0.95
 
 def patch_scan(vlm, clean_inp, corr_inp, pos=("Yes",), neg=("No",), L: int = 36,
                win: int = 4, groups=("vis_box", "vis_all", "q", "last"),
-               box_mask_idx: torch.Tensor | None = None) -> dict[tuple[str, int], float]:
-    """Activation patching normalized logit-difference recovery (FR-T4-8; design §5.10)."""
+               box_mask_idx: torch.Tensor | None = None,
+               return_raw: bool = False) -> dict:
+    """Activation patching normalized logit-difference recovery (FR-T4-8; design §5.10).
+    Under C13 (2309.16042), return_raw=True returns both normalized recovery and raw delta_s."""
     from ea.model import Tap
     assert clean_inp["input_ids"].shape == corr_inp["input_ids"].shape, "token lengths differ"
     with Tap(vlm) as t:
@@ -246,8 +248,9 @@ def patch_scan(vlm, clean_inp, corr_inp, pos=("Yes",), neg=("No",), L: int = 36,
     clean = {i: h.clone() for i, h in t.cap.items()}
     s_corr = vlm.score_inp(corr_inp, pos, neg)
 
+    zero_val = ({"recovery": 0.0, "delta_s": 0.0} if return_raw else 0.0)
     if abs(s_clean - s_corr) < 1e-4:
-        return {(pg, l): 0.0 for pg in groups for l in range(3, L - win + 1, win)}
+        return {(pg, l): zero_val for pg in groups for l in range(3, L - win + 1, win)}
 
     g = vlm.groups(corr_inp)
     P = dict(
@@ -265,8 +268,30 @@ def patch_scan(vlm, clean_inp, corr_inp, pos=("Yes",), neg=("No",), L: int = 36,
             patch_dict = {i: _make_patch(i, pg) for i in range(l, l + win)}
             with Tap(vlm, patch=patch_dict):
                 s_p = vlm.score_inp(corr_inp, pos, neg)
-            res[(pg, l)] = float((s_p - s_corr) / (s_clean - s_corr))
+            delta_s = float(s_p - s_corr)
+            recovery = float(delta_s / (s_clean - s_corr))
+            res[(pg, l)] = ({"recovery": recovery, "delta_s": delta_s} if return_raw else recovery)
     return res
+
+
+def is_patch_causal(patch_results: list[dict], min_recovery: float = 0.3,
+                    min_delta_s: float = 0.5) -> bool:
+    """Robustness check (C13 / FR-T4-8; 2309.16042):
+    A patching result counts as causal only if it holds under >= 2 corruption
+    methods and BOTH metrics (normalized recovery >= min_recovery and raw |delta_s| >= min_delta_s).
+    """
+    if len(patch_results) < 2:
+        return False
+    passed_corruptions = 0
+    for p in patch_results:
+        has_causal = any(
+            (v["recovery"] >= min_recovery and abs(v.get("delta_s", 0.0)) >= min_delta_s)
+            if isinstance(v, dict) else (v >= min_recovery)
+            for v in p.values()
+        )
+        if has_causal:
+            passed_corruptions += 1
+    return passed_corruptions >= 2
 
 
 # ----------------------------------------------------------------- FR-T4-9 token similarity

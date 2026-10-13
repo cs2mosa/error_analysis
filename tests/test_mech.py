@@ -3,6 +3,7 @@
 Coverage:
   - FR-T4-2: probe accuracy and selectivity on linearly separable synthetic data.
   - FR-T4-4: probe_verdict decision rule covering all branches (encoder limit, H1, H2, H3).
+  - FR-T4-8: is_patch_causal dual-metric dual-corruption robustness (C13; 2309.16042).
   - FR-T4-9: visual token similarity across depth.
   - FR-T4-10: evidence rule (>= 2 independent methods: decodability + causal).
 """
@@ -12,6 +13,7 @@ import torch
 
 from ea.mech import (
     internal_label,
+    is_patch_causal,
     probe,
     probe_verdict,
     t4_tag,
@@ -98,6 +100,29 @@ def test_evidence_rule_internal_label():
         dict(method="patching", kind="causal", supports="H2"),
     ]
     assert internal_label(ev_conflict) == "unresolved (single method)"
+
+
+# ----------------------------------------------------------------- FR-T4-8: is_patch_causal (C13)
+
+def test_is_patch_causal_requires_two_corruptions_and_both_metrics():
+    """C13 / FR-T4-8: causal only if >= 2 corruptions pass BOTH recovery >= 0.3 AND |delta_s| >= 0.5."""
+    # Case 1: only 1 corruption provided -> False regardless of values
+    strong = {("vis_all", 3): {"recovery": 0.9, "delta_s": 1.5}}
+    assert is_patch_causal([strong]) is False
+
+    # Case 2: 2 corruptions, both pass both thresholds -> True
+    assert is_patch_causal([strong, strong]) is True
+
+    # Case 3: 2 corruptions, one fails on delta_s -> only 1 passes -> False
+    weak_delta = {("vis_all", 3): {"recovery": 0.9, "delta_s": 0.1}}
+    assert is_patch_causal([strong, weak_delta]) is False
+
+    # Case 4: 2 corruptions, one fails on recovery -> only 1 passes -> False
+    weak_rec = {("vis_all", 3): {"recovery": 0.1, "delta_s": 1.5}}
+    assert is_patch_causal([strong, weak_rec]) is False
+
+    # Case 5: 2 corruptions, both weak -> False
+    assert is_patch_causal([weak_delta, weak_rec]) is False
 
 
 # ----------------------------------------------------------------- FR-T4-9: visual token similarity

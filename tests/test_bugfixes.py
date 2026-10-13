@@ -175,6 +175,20 @@ def test_nli_deterministic_and_linear():
     assert abs(out[mask].mean() - 100.0) < 5.0
 
 
+def test_nli_2d_stencil_converges():
+    """ROAD §5.2: masked pixels surrounded by constant-valued neighbors must converge
+    to that constant under the 2D harmonic stencil (w_d=1/6, w_i=1/12)."""
+    # Constant-valued image at 200; mask interior pixels (not boundary)
+    img = np.full((20, 20, 3), 200.0)
+    mask = np.zeros((20, 20), bool)
+    mask[5:15, 5:15] = True                              # interior block, surrounded by 200
+    out = nli(img, mask, noise_std=0.0, seed=0, iters=40)
+    # After stencil relaxation with constant boundary, masked region must be ≈ 200
+    assert abs(out[mask].mean() - 200.0) < 2.0, (
+        f"2D stencil did not converge: mean={out[mask].mean():.2f}"
+    )
+
+
 # ----------------------------------------------------------------- BUG-10
 
 def _video(onset, end=None):
