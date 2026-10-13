@@ -5,7 +5,7 @@ import argparse
 import sys
 
 
-def main(argv=None):
+def build_parser():
     ap = argparse.ArgumentParser(prog="ea")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -29,6 +29,8 @@ def main(argv=None):
     sr.add_argument("--out", default="outputs/escalate", metavar="DIR")
     sr.add_argument("--validate-csv", default=None, metavar="PATH")
     sr.add_argument("--cfg", default="ea/config.yaml", metavar="PATH")
+    sr.add_argument("--t3-dir", default="outputs/t3", metavar="DIR", help="directory containing t3_loc.json")
+    sr.add_argument("--t4-dir", default="outputs/t4", metavar="DIR", help="directory containing t4_verdicts.json")
 
     # validate — known-cause injections → confusion.csv (M3b)
     sv = sub.add_parser("validate", help="measure false-attribution rate (FR-V)")
@@ -61,7 +63,13 @@ def main(argv=None):
     s4.add_argument("--cfg", default="ea/config.yaml")
     s4.add_argument("--model", default=None, metavar="PATH_OR_REPO")
 
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
     args, rest = ap.parse_known_args(argv)
+
 
     if args.cmd == "selfcheck":
         from ea.selfcheck import main as selfcheck_main
@@ -99,23 +107,8 @@ def _add_run_args(p):
 
 
 def _load_cfg(path):
-    import yaml
-    from pathlib import Path
-    cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    # BUG-13: machine-specific overrides (model.path, GPU limits) live in
-    # config.local.yaml (git-ignored); config.yaml stays portable.
-    local = Path(path).parent / "config.local.yaml"
-    if local.exists():
-        over = yaml.safe_load(local.read_text(encoding="utf-8")) or {}
-
-        def _merge(a, b):
-            for k, v in b.items():
-                if isinstance(v, dict) and isinstance(a.get(k), dict):
-                    _merge(a[k], v)
-                else:
-                    a[k] = v
-        _merge(cfg, over)
-    return cfg
+    from ea import load_cfg
+    return load_cfg(path)
 
 
 def _resolve_runs(path, for_write=False):
@@ -222,17 +215,20 @@ def _run_report(args):
     runs = load_runs(runs_path)
     out = Path(args.out)
 
-    # BUG-03: merge the T3/T4 diagnostics written by `ea t3` / `ea t4` so the
-    # SIG rows requiring loc/t4/causal can finally match.
+    # BUG-03 / NEW-10: merge T3/T4 diagnostics from configurable directories
+    t3_dir = Path(getattr(args, "t3_dir", "outputs/t3") or "outputs/t3")
+    t4_dir = Path(getattr(args, "t4_dir", "outputs/t4") or "outputs/t4")
     external = {}
-    for name, fname in (("outputs/t3", "t3_loc.json"), ("outputs/t4", "t4_verdicts.json")):
-        p = Path(name) / fname
+    for p_dir, fname in ((t3_dir, "t3_loc.json"), (t4_dir, "t4_verdicts.json")):
+        p = p_dir / fname
         if p.exists():
             try:
                 for cluster, diags in json.loads(p.read_text(encoding="utf-8")).items():
                     external.setdefault(cluster, {}).update(diags)
             except (json.JSONDecodeError, OSError) as e:
                 print(f"[report] ignoring unreadable {p}: {e!r}")
+        else:
+            print(f"[report] note: {p} not found; run '{fname.split('_')[0]}' tier if that evidence is desired.")
     if external:
         print(f"[report] merged T3/T4 diagnostics for {len(external)} clusters")
 
@@ -401,23 +397,32 @@ def _run_t3(args):
         return lambda im: vlm.score_inp(vlm.prep(text, images=[im]), pos, neg)
 
     # --- explainer-validity gate (FR-T3-6): computed on real deletion curves
-    gate_ok_all, gate_details = True, []
-    for sid in list(err.sample_id)[:5]:
+    t3_cfg = cfg.get("t3", {})
+    gate_samples = int(t3_cfg.get("gate_samples", 10))
+    gate_pass_rate = float(t3_cfg.get("gate_pass_rate", 0.7))
+    gate_steps = int(t3_cfg.get("gate_steps", 4))
+
+    gate_details, n_valid = [], 0
+    for sid in list(err.sample_id)[:gate_samples]:
         s = smap[sid]
         inp = vlm.prep(prompt_text(s), images=[open_img(s)])
         amap = map_attn(vlm, inp, ratio=ratio)
         res = explainer_validity_gate(score_fn_factory(s), open_img(s), amap,
-                                      steps=4, sign=int(2 * s.label - 1))
+                                      steps=gate_steps, sign=int(2 * s.label - 1))
         gate_details.append(dict(sample_id=sid, **res))
-        gate_ok_all &= bool(res["valid"])
-    gate = dict(valid=bool(gate_ok_all and gate_details), n_samples=len(gate_details),
+        if res.get("valid"):
+            n_valid += 1
+    pass_rate = (n_valid / len(gate_details)) if gate_details else 0.0
+    gate_valid = bool(gate_details and pass_rate >= gate_pass_rate)
+    gate = dict(valid=gate_valid, pass_rate=round(pass_rate, 3),
+                n_samples=len(gate_details), n_valid=n_valid,
                 status="computed (FR-T3-6)" if gate_details else "no error samples",
-                tag=None if gate_ok_all else "UNVALIDATED", details=gate_details)
+                tag=None if gate_valid else "UNVALIDATED", details=gate_details)
     (out / "t3_gate.json").write_text(json.dumps(gate, indent=2), encoding="utf-8")
-    print(f"[t3] explainer gate: valid={gate['valid']} ({len(gate_details)} samples)")
+    print(f"[t3] explainer gate: valid={gate['valid']} (pass_rate={gate['pass_rate']}, {len(gate_details)} samples)")
 
-    # --- maps + localization for errors and matched corrects
-    rows, enr = [], {}
+    # --- maps + localization for errors and matched corrects (O(1) dictionary lookup)
+    rows, enr_map = [], {}
     for ids, kind in ((list(err.sample_id), "err"), (list(matched_cor.sample_id), "cor")):
         for sid in ids:
             s = smap[sid]
@@ -428,29 +433,33 @@ def _run_t3(args):
             vbox = next((b["xyxy"] for b in s.boxes if b["role"] == "violator"), None)
             a_res = loc(amap, vbox) if vbox else {}
             g_res = loc(gmap, vbox) if vbox else {}
-            enr.setdefault(kind, []).append(a_res.get("enrich", np.nan))
+            enr_map[(kind, sid)] = a_res.get("enrich", np.nan)
             rows.append(dict(sample_id=sid, kind=kind, explainer="attn", **a_res))
             rows.append(dict(sample_id=sid, kind=kind, explainer="grad", **g_res))
     pd.DataFrame(rows).to_csv(out / "t3_loc.csv", index=False)
 
     # --- SpRAy over error maps (exploratory, C11)
+    spray_k = int(t3_cfg.get("spray_k", 4))
     err_maps = [np.load(out / "maps" / f"{sid}.npz")["attn"] for sid in err.sample_id]
-    spray_ids = spray_cluster(err_maps, k=4, seed=0).tolist() if err_maps else []
+    spray_ids = spray_cluster(err_maps, k=spray_k, seed=0).tolist() if err_maps else []
     pd.DataFrame(dict(sample_id=list(err.sample_id), spray=spray_ids)).to_csv(
         out / "t3_spray.csv", index=False)
 
     # --- per-cluster 3-way reading (FR-T3-4, C8) — names identical to escalate()
     clusters = build_clusters(errors_table(runs, S), matched_cor, runs, cfg)
-    err_ids, cor_ids = list(err.sample_id), list(matched_cor.sample_id)
     loc_cfg = cfg.get("loc", {})
+    min_samples = int(loc_cfg.get("min_samples", 3))
     verdicts = {}
     for c in clusters:
-        box_err = [enr["err"][err_ids.index(i)] for i in c.err_ids if i in err_ids]
-        box_cor = [enr["cor"][cor_ids.index(i)] for i in c.cor_ids if i in cor_ids]
+        box_err = [enr_map[("err", i)] for i in c.err_ids if ("err", i) in enr_map]
+        box_cor = [enr_map[("cor", i)] for i in c.cor_ids if ("cor", i) in enr_map]
+        # Filter NaNs from absence scenes without violator boxes (NEW-08a)
+        box_err = [x for x in box_err if np.isfinite(x)]
+        box_cor = [x for x in box_cor if np.isfinite(x)]
         if not gate["valid"]:
             verdicts[c.name] = {"loc": None, "t3_gate": "UNVALIDATED"}
-        elif not box_err or not box_cor:
-            verdicts[c.name] = {"loc": None}          # under-powered: abstain
+        elif len(box_err) < min_samples or len(box_cor) < min_samples:
+            verdicts[c.name] = {"loc": None}          # under-powered / absence scenes: abstain
         else:
             verdicts[c.name] = {"loc": three_way(
                 box_err, box_cor,
@@ -487,21 +496,34 @@ def _run_t4(args):
         return render(PROMPTS["d0"], s)
 
     def viol_box(s):
-        return next((b["xyxy"] for b in s.boxes if b["role"] == "violator"),
-                    [0.0, 0.0, 1.0, 1.0])
+        v = next((b["xyxy"] for b in s.boxes if b["role"] == "violator"), None)
+        if v is None and (s.meta or {}).get("vtype") == "absence":
+            return None  # absence scenes have no violator object: abstain rather than whole-image fallback
+        return v or [0.0, 0.0, 1.0, 1.0]
 
     # --- feature cache (FR-T4-1): stratified subset, errors + matched corrects
-    cap = int((cfg.get("t4") or {}).get("max_samples", 40))
-    ids_err = list(err.sample_id)[:cap // 2]
-    ids_cor = list(matched_cor.sample_id)[:cap // 2]
+    t4_cfg = cfg.get("t4") or {}
+    cap = int(t4_cfg.get("max_samples", 40))
+    dino_model = str(t4_cfg.get("dino_model", "facebook/dinov2-base"))
+    rng = np.random.default_rng(int(cfg.get("seed", 0)))
+    err_list = list(err.sample_id)
+    cor_list = list(matched_cor.sample_id)
+    k_err = min(len(err_list), cap // 2)
+    k_cor = min(len(cor_list), cap // 2)
+    ids_err = list(rng.choice(err_list, size=k_err, replace=False)) if k_err else []
+    ids_cor = list(rng.choice(cor_list, size=k_cor, replace=False)) if k_cor else []
+
     from ea.mech import dinov2_pool
     for sid in ids_err + ids_cor:
         s = smap[sid]
-        cache_sample(vlm, s, prompt_text(s), viol_box(s), out / "cache")
-        dino = dinov2_pool(Image.open(s.media), viol_box(s))   # FR-T4-3 ceiling
+        vbox = viol_box(s)
+        cache_sample(vlm, s, prompt_text(s), vbox, out / "cache")
+        dino = dinov2_pool(Image.open(s.media), vbox, model_name=dino_model)   # FR-T4-3 ceiling
         if dino is not None:
-            np.savez(out / "cache" / f"{sid}.npz",
-                     **{**np.load(out / "cache" / f"{sid}.npz"), "dino": dino})
+            cache_p = out / "cache" / f"{sid}.npz"
+            with np.load(cache_p) as prev:
+                merged_feats = {**prev, "dino": dino}
+            np.savez(cache_p, **merged_feats)
     if len(ids_err) + len(ids_cor) < 4:
         print("[t4] too few cached samples — writing empty verdicts")
         (out / "t4_verdicts.json").write_text("{}", encoding="utf-8")
@@ -516,7 +538,8 @@ def _run_t4(args):
     y = np.array([int(smap[sid].label) for sid in ids])
     is_err = np.array([sid in set(ids_err) for sid in ids])
     pairs = {sid: smap[sid].pair_id for sid in ids}
-    groups = [pairs[sid] for sid in ids if pairs[sid]] or None
+    # NEW-09(a): fall back to sid so groups is never shorter than ids and y
+    groups = [pairs[sid] if pairs.get(sid) else sid for sid in ids]
     dec_acc = float(cfg.get("probe", {}).get("decodable_acc", 0.70))
     min_sel = float(cfg.get("probe", {}).get("selectivity", 0.15))
 
@@ -581,7 +604,9 @@ def _run_t4(args):
             bucket.append(abs(float(eff)))
     ko_err_v = float(np.median(ko_err)) if ko_err else 0.0
     ko_cor_v = float(np.median(ko_cor)) if ko_cor else 0.0
-    causal = bool(ko_err_v > 0.05 and ko_err_v >= 2 * max(ko_cor_v, 1e-9))
+    causal_min_effect = float(t4_cfg.get("causal_min_effect", 0.05))
+    causal_ratio = float(t4_cfg.get("causal_ratio", 2.0))
+    causal = bool(ko_err_v > causal_min_effect and ko_err_v >= causal_ratio * max(ko_cor_v, 1e-9))
     pd.DataFrame([dict(median_knockout_effect_err=ko_err_v,
                        median_knockout_effect_cor=ko_cor_v, causal=causal)]).to_csv(
         out / "t4_knockout.csv", index=False)
@@ -599,10 +624,13 @@ def _run_t4(args):
     probed = set(ids_err)
     verdicts = {}
     for c in clusters:
-        if probed & set(c.err_ids):
+        c_probed_errs = [sid for sid in c.err_ids if sid in probed]
+        if c_probed_errs:
             verdicts[c.name] = dict(
                 t4=(label if resolved == label else None),
                 causal=causal, verdict=verdict,
+                pooled=True,
+                n_probed_errors=len(c_probed_errs),
                 evidence=(f"probe+knockout ({resolved})" if resolved == label
                           else f"unresolved (single method; verdict={verdict})"))
     (out / "t4_verdicts.json").write_text(json.dumps(verdicts, indent=2), encoding="utf-8")

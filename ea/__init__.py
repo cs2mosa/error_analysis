@@ -8,9 +8,22 @@ import yaml
 
 @lru_cache(None)
 def load_cfg(path: str | None = None) -> dict:
-    """Load config.yaml (GC-6: the single source of [PROPOSED] values)."""
+    """Load config.yaml (GC-6: the single source of [PROPOSED] values).
+    Merges config.local.yaml if present (BUG-13 / NEW-14 fix)."""
     p = Path(path) if path else Path(__file__).parent / "config.yaml"
-    return yaml.safe_load(open(p, encoding="utf-8"))
+    cfg = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    local = p.parent / "config.local.yaml"
+    if local.exists():
+        over = yaml.safe_load(local.read_text(encoding="utf-8")) or {}
+
+        def _merge(a, b):
+            for k, v in b.items():
+                if isinstance(v, dict) and isinstance(a.get(k), dict):
+                    _merge(a[k], v)
+                else:
+                    a[k] = v
+        _merge(cfg, over)
+    return cfg
 
 
 def model_ref(cfg, override=None) -> str:

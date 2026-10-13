@@ -140,8 +140,9 @@ def _add_knob_jobs(cfg, s, add):
     kn = cfg.get("knobs") or {}
     mp = kn.get("max_pixels") or {}
     if isinstance(mp, dict):
-        for vname, num in mp.items():                     # {low: n, native: null, high: n}
-            mcfg = dict(BASE_MCFG, max_pixels=num)
+        for vname, num in mp.items():                     # {low: n, native: 1048576, high: n}
+            min_px = 1048576 if vname == "high" else None
+            mcfg = dict(BASE_MCFG, max_pixels=num, min_pixels=min_px)
             add(Job(s.id, "d0", "base", dict(knob="max_pixels", value=vname), mcfg))
     elif isinstance(mp, (list, tuple)):                   # numeric list from config
         for num in mp:
@@ -310,11 +311,14 @@ def one(vlm, s, j: Job, k: str, cfg):
     else:
         r = vlm.score(text, **media, pos=p["pos"], neg=p["neg"])
     valid = r["mass"] >= cfg["answer"]["min_mass"]    # C16
+    extra_dict = dict(mass=r["mass"], mem=r.get("mem"))
+    if j.params.get("knob") == "token_budget":
+        extra_dict["keep_frac"] = float(j.params.get("value", 1.0))
     row = dict(key=k, sample_id=s.id, prompt_id=j.prompt, group=p["group"], arm=j.arm,
                **knob_fields(j), model_cfg=j.mcfg, s=r["s"], pred=int(r["s"] > 0),
                gold=g, correct=int((r["s"] > 0) == g), n_vis_tokens=r["n_vis"],
                latency_ms=r["ms"], t=j.params.get("t_end"),
-               extra=json.dumps(dict(mass=r["mass"], mem=r.get("mem"))))
+               extra=json.dumps(extra_dict))
     row["valid"] = bool(valid)
     return row
 
@@ -354,7 +358,7 @@ def errors_table(runs, S, min_votes=2):
     if undetermined:
         print(f"[errors_table] {undetermined} samples with < {min_votes} valid D rows "
               "left undetermined (NFR-5)")
-    v = v[votes >= min_votes]
+    v = v[votes >= min_votes].copy()
     v["pred"] = (v.n_pos > v.n_neg).astype(int)       # strict majority
     v.loc[v.n_pos == v.n_neg, "pred"] = (v.loc[v.n_pos == v.n_neg, "s"] > 0).astype(int)
     df = to_df(S).set_index("id")
@@ -476,14 +480,11 @@ def validate(runs, S, cfg, out_dir="outputs/validate", vlm_factory=None):
 
     from ea.escalate import INJ_EXPECTED, SIG, Cluster, decide, run_diagnostics, wil
 
-    # pool: confident-correct samples under base (as before)
+    # pool: confident-correct samples under base (BUG-14 / NEW-11b fix: uses errors_table)
     if runs is not None and not runs.empty:
-        d = runs[(runs.arm == "base") & (runs.group == "D") & runs.valid]
-        if not d.empty:
-            v = d.groupby("sample_id").agg(
-                pred=("pred", lambda x: int(pd.Series(x).value_counts().idxmax())),
-                s=("s", "mean"), gold=("gold", "first"))
-            confident = set(v[(v.pred == v.gold) & (v.s.abs() >= conf_margin)].index)
+        et_base = errors_table(runs, S, min_votes=2)
+        if not et_base.empty:
+            confident = set(et_base[(et_base.err == 0) & (et_base.s.abs() >= conf_margin)].sample_id)
             pool = sorted((s for s in S if s.id in confident), key=lambda x: x.id)
         else:
             pool = sorted(S, key=lambda x: x.id)
@@ -499,6 +500,7 @@ def validate(runs, S, cfg, out_dir="outputs/validate", vlm_factory=None):
 
     vruns_path = out_dir / "validate_runs.jsonl"
     rng = np.random.default_rng(0)
+    val_run_cfg = dict(cfg, t2=dict(cfg.get("t2", {}), extra_arms=False))
     for arm, expected in INJ_EXPECTED.items():
         take = min(per_cause_n, len(pool))
         if take < per_cause_n:
@@ -506,17 +508,21 @@ def validate(runs, S, cfg, out_dir="outputs/validate", vlm_factory=None):
                   "(underpowered, FR-V-1)")
         chosen = list(rng.choice(len(pool), size=take, replace=False))
         S_inj, flip_ids = [], set()
-        if arm == "INJ.label":
-            flip_ids = {pool[i].id for i in chosen
-                        if rng.random() < label_noise}
+        if arm == "INJ.label" and label_noise > 0.0:
+            # NEW-11a fix: flip enough samples to reach exit.min_n (sufficient statistical power)
+            min_n = int((cfg.get("exit", {}) if cfg else {}).get("min_n", 10))
+            n_flips = min(take, max(min_n, int(take * label_noise)))
+            flip_indices = rng.choice(chosen, size=n_flips, replace=False)
+            flip_ids = {pool[i].id for i in flip_indices}
         for i in chosen:
             s = pool[i]
             others = [x.media for x in pool if x.id != s.id][:4]
             S_inj.append(_materialize_injection(arm, s, ".", out_dir, others,
                                                 flipped=s.id in flip_ids))
         E_inj = {s.id for s in S_inj}
-        jobs = plan_t0(cfg, S_inj) + plan_t1(cfg, S_inj, E_inj) + plan_t2(cfg, S_inj, E_inj)
-        n_new = run(jobs, S_inj, cfg, out=vruns_path, vlm_factory=vlm_factory)
+        # NEW-11c fix: run only diagnostic arms (extra_arms=False)
+        jobs = plan_t0(val_run_cfg, S_inj) + plan_t1(val_run_cfg, S_inj, E_inj) + plan_t2(val_run_cfg, S_inj, E_inj)
+        n_new = run(jobs, S_inj, val_run_cfg, out=vruns_path, vlm_factory=vlm_factory)
         vruns = load_runs(vruns_path)
 
         # one sub-cluster per (injection, rule class): real diagnostics on the

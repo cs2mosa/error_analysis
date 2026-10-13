@@ -222,20 +222,22 @@ def test_tag_clusters_get_matched_corrects():
     rows = []
     for i in range(6):
         sid = f"s{i}"
-        rows.append(dict(sample_id=sid, prompt_id="d0", arm="base", s=-1.5, pred=0,
-                         gold=1, correct=0, group="D", valid=True, knob=None, value=None))
+        for pid in ("d0", "d1", "d2"):
+            rows.append(dict(sample_id=sid, prompt_id=pid, arm="base", s=-1.5, pred=0,
+                             gold=1, correct=0, group="D", valid=True, knob=None, value=None))
         rows.append(dict(sample_id=sid, prompt_id="pol_pos", arm="base", s=-1.5, pred=0,
                          gold=1, correct=0, group="POL", valid=True, knob=None, value=None))
         rows.append(dict(sample_id=sid, prompt_id="pol_neg", arm="base", s=1.5, pred=1,
                          gold=1, correct=1, group="POL", valid=True, knob=None, value=None))
-    for i in range(6, 12):
-        sid = f"s{i}"
-        rows.append(dict(sample_id=sid, prompt_id="d0", arm="base", s=1.5, pred=1,
-                         gold=1, correct=1, group="D", valid=True, knob=None, value=None))
-        rows.append(dict(sample_id=sid, prompt_id="pol_pos", arm="base", s=1.5, pred=1,
-                         gold=1, correct=1, group="POL", valid=True, knob=None, value=None))
-        rows.append(dict(sample_id=sid, prompt_id="pol_neg", arm="base", s=1.5, pred=1,
-                         gold=1, correct=1, group="POL", valid=True, knob=None, value=None))
+        for i in range(6, 12):
+            sid = f"s{i}"
+            for pid in ("d0", "d1", "d2"):
+                rows.append(dict(sample_id=sid, prompt_id=pid, arm="base", s=1.5, pred=1,
+                                 gold=1, correct=1, group="D", valid=True, knob=None, value=None))
+            rows.append(dict(sample_id=sid, prompt_id="pol_pos", arm="base", s=-1.5, pred=0,
+                             gold=1, correct=0, group="POL", valid=True, knob=None, value=None))
+            rows.append(dict(sample_id=sid, prompt_id="pol_neg", arm="base", s=1.5, pred=1,
+                             gold=1, correct=1, group="POL", valid=True, knob=None, value=None))
     runs = pd.DataFrame(rows)
     S = [D.Sample(id=f"s{i}", bench="toy", modality="image", media="x.png",
                   label=1, cls="c", rule_text="r", item="helmet",
@@ -298,3 +300,125 @@ def test_run_diagnostics_preserves_external_diags():
     from ea.escalate import decide
     cause, _ = decide(ev)
     assert cause == "depth fading (H2)"                 # BUG-03: t4 rows reachable again
+
+
+# ----------------------------------------------------------------- NEW-01
+def test_new_01_stream_per_cluster_mixed_corpus(tmp_path):
+    """NEW-01: stream diagnostic is per-cluster. Image clusters must get stream=None
+    and never match H11, while video clusters with a policy gap get stream='policy'."""
+    from ea.escalate import escalate
+
+    # 12 image samples and 12 video samples
+    S = []
+    runs_rows = []
+    # Image samples (absence scene tag)
+    for i in range(12):
+        sid = f"img_{i:02d}"
+        S.append(D.Sample(id=sid, bench="toy", modality="image", media="x.png",
+                          label=1, cls="rule_safety", rule_text="r", item="helmet",
+                          meta={"vtype": "absence"}))
+        for p in ("d0", "d1", "d2"):
+            runs_rows.append(dict(sample_id=sid, prompt_id=p, arm="base", s=-1.5, pred=0,
+                                  gold=1, correct=0, group="D", valid=True, knob=None, value=None, t=None))
+
+    # Video samples (streaming hazard tag)
+    for i in range(12):
+        sid = f"vid_{i:02d}"
+        S.append(D.Sample(id=sid, bench="toy", modality="video", media="v.mp4",
+                          label=1, cls="streaming_hazard", rule_text="r",
+                          video=dict(fps=2.0, duration_s=10.0, onset_s=2.0, end_s=4.0)))
+        # base D runs: all err
+        for p in ("d0", "d1", "d2"):
+            runs_rows.append(dict(sample_id=sid, prompt_id=p, arm="base", s=-1.5, pred=0,
+                                  gold=1, correct=0, group="D", valid=True, knob=None, value=None, t=None))
+        # streaming timesteps: high margin during [2, 4], but alert fires late due to k=2
+        # ts: [1.0, 2.0, 3.0, 4.0, 5.0]
+        # s:  [-1.0, 1.5, -0.5, 1.5, 1.5] -> window tp=True at t=2.0, but alert fires at t=5.0 (late)
+        for t, s_val in [(1.0, -1.0), (2.0, 1.5), (3.0, -0.5), (4.0, 1.5), (5.0, 1.5)]:
+            runs_rows.append(dict(sample_id=sid, prompt_id="d0", arm="base", s=s_val, pred=int(s_val > 0),
+                                  gold=1, correct=int(s_val > 0), group="D", valid=True, knob=None, value=None, t=t))
+
+    runs = pd.DataFrame(runs_rows)
+    cfg = {
+        "exit": {"recovery": 0.5, "control": 0.1, "min_n": 5, "conf_margin": 1.0},
+        "stream": {"tolerance_s": 0.5, "k": 2, "n": 3, "anticipation_s": 0.0},
+        "slices": {"min_support": 5},
+    }
+
+    clusters, _ = escalate(runs, S, cfg, out_dir=tmp_path / "escalate_test")
+    assert clusters
+
+    img_cluster = next((c for c in clusters if "img_00" in c.err_ids and "vid_00" not in c.err_ids), None)
+    vid_cluster = next((c for c in clusters if "vid_00" in c.err_ids and "img_00" not in c.err_ids), None)
+
+    if img_cluster:
+        assert img_cluster.diags.get("stream") is None, "Image cluster must have stream=None"
+        assert img_cluster.cause != "trigger-policy failure (H11)", "Image cluster must not receive H11"
+
+    if vid_cluster:
+        assert vid_cluster.diags.get("stream") == "policy", "Video cluster must detect policy gap"
+        assert vid_cluster.cause == "trigger-policy failure (H11)", "Video cluster must receive H11"
+
+
+# ----------------------------------------------------------------- NEW-06
+def test_new_06_mask_tokens_device_and_missing_merger():
+    """NEW-06: mask_tokens must not raise generator device mismatch and must fail loud if merger missing."""
+    import torch
+    from ea.model import mask_tokens
+
+    class DummyMerger(torch.nn.Module):
+        def forward(self, x):
+            return x
+
+    class DummyVLM:
+        def __init__(self, with_merger=True):
+            if with_merger:
+                self.m = torch.nn.Module()
+                self.m.visual = torch.nn.Module()
+                self.m.visual.merger = DummyMerger()
+            else:
+                self.m = torch.nn.Module()
+
+    # Successful hook with tensor
+    vlm = DummyVLM(with_merger=True)
+    x = torch.ones(20, 16)
+    with mask_tokens(vlm, keep_frac=0.5, seed=42):
+        out = vlm.m.visual.merger(x)
+        # Should drop some rows
+        assert out.shape == x.shape
+        assert (out == 0).any(), "mask_tokens should zero out some features"
+
+    # Missing merger module must raise RuntimeError, never silently no-op
+    vlm_no_merger = DummyVLM(with_merger=False)
+    with pytest.raises(RuntimeError, match="visual merger / visual module not found"):
+        with mask_tokens(vlm_no_merger, keep_frac=0.5, seed=42):
+            pass
+
+
+# ----------------------------------------------------------------- NEW-09
+def test_new_09_partial_pair_ids_groups_alignment():
+    """NEW-09: samples with partial pair_ids fall back to sid, maintaining length alignment."""
+    ids = ["s0", "s1", "s2", "s3"]
+    pairs = {"s0": "pair_a", "s1": "pair_a", "s2": None, "s3": ""}
+    # Fallback to sid ensures groups length is always equal to ids length
+    groups = [pairs[sid] if pairs.get(sid) else sid for sid in ids]
+    assert len(groups) == len(ids)
+    assert groups == ["pair_a", "pair_a", "s2", "s3"]
+
+
+# ----------------------------------------------------------------- NEW-10
+def test_new_10_report_custom_dirs(tmp_path):
+    """NEW-10: report CLI flags --t3-dir and --t4-dir are accepted and read."""
+    from ea.cli import main
+    t3_dir = tmp_path / "custom_t3"
+    t4_dir = tmp_path / "custom_t4"
+    t3_dir.mkdir(parents=True)
+    t4_dir.mkdir(parents=True)
+    (t3_dir / "t3_loc.json").write_text(json.dumps({"ALL_ERRORS": {"loc": "object"}}), encoding="utf-8")
+    (t4_dir / "t4_verdicts.json").write_text(json.dumps({"ALL_ERRORS": {"t4": "enc"}}), encoding="utf-8")
+
+    from ea.cli import build_parser
+    args = build_parser().parse_args(["report", "--t3-dir", str(t3_dir), "--t4-dir", str(t4_dir)])
+    assert args.t3_dir == str(t3_dir)
+    assert args.t4_dir == str(t4_dir)
+

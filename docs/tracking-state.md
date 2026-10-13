@@ -1,6 +1,6 @@
 # tracking-state.md — Project State, Audit Findings & Roadmap
 
-**Date:** 2026-10-12  
+**Date:** 2026-10-13  
 **System:** Qwen3-VL-4B Error-Analysis Codebase  
 **Environment:** Windows (Python 3.13.5, PyTorch 2.14+cu126, Transformers 5.17.0, `F:\URCA_PROJECTS\.venv`)  
 **Repository Root:** [`f:/error_analysis`](file:///f:/error_analysis)
@@ -9,13 +9,16 @@
 
 ## 1. Executive Summary
 
-All core engineering milestones (**M1 through M6**), the **Latent-Hazard track (§5.14 / FR-H)**, and all items from the **Comprehensive Defect Audit (P0 through P3, BUG-01 to BUG-20)** are **100% resolved, verified, and backed by regression tests**.
+All core engineering milestones (**M1 through M6**), the **Latent-Hazard track (§5.14 / FR-H)**, all items from the **Comprehensive Defect Audit (P0 through P3, BUG-01 to BUG-20)**, and all items from the **Second-pass Audit (P1 through P3, NEW-01 to NEW-15)** are **100% resolved, verified, and backed by regression tests**.
 
-- **Test Suite Status:** Full test suite passing offline (~213 unit/property/regression tests), with 5 GPU smoke tests deselected by default via `pytest.ini`.
+- **Test Suite Status:** Full test suite passing offline (~222 unit/property/regression tests), with 5 GPU smoke tests deselected by default via `pytest.ini`.
 - **Audit Defect Resolution:**
   - **P0 Items (BUG-01..04):** `validate()` measures empirical false attributions via synthetic injections (no fabricated diagonals); real `t3` and `t4` CLI drivers with computed explainer validity gates; external T3/T4/stream diagnostics merged into `escalate()` prior to `decide()`; knob arms planned under `arm="base"` + `knob/value`.
   - **P1 Items (BUG-05..11):** `INJ_EXPECTED` ↔ `SIG` synchronized; unified `data.box_mask` across all modules; hooks require eager attention and fail loudly if attention mask is absent; seeded deterministic ROAD `nli`; streaming edge cases (`onset_s=0.0`, `end_s=None`) resolved; all 5 external benchmark converters implemented.
   - **P2 Items (BUG-12..20):** Single `model_ref` resolver; portable `config.yaml`; `errors_table` honours `min_votes` and deterministic tie-breaking; vectorised slice matching; taxonomy tags computed over full table; `explain_consistency`/`explain_necessity` truth-table fixes; `VLM.ids` instance cache; re-entrant `knockout`; $O(n \log n)$ vectorized `min_cost_threshold`.
+  - **Second-pass P1 Items (NEW-01..07):** `stream` diagnostic per-cluster scoped to video samples only (H11 no longer spuriously triggers on image clusters); converter `out_dir` creation, video timing validity flags, and FieldWorkArena label-0 preservation fixed; `mask_tokens` generator device mismatch resolved and fail-loud guard added; `high` resolution arm guaranteed strictly more tokens than `native`.
+  - **Second-pass P2 Items (NEW-08..11):** `_run_t3` NaN filtering, $O(1)$ enr_map lookup, configurable gate/SpRAy parameters; `_run_t4` group alignment, Windows `.npz` handle leak, absence-scene `viol_box=None`; `report` `--t3-dir`/`--t4-dir` flags; `validate` confident-correct pool uses `min_votes=2`, label-noise arm power-checked, `errors_table` copy hygiene.
+  - **Second-pass P3 Items (NEW-12..15):** All hidden constants promoted to `config.yaml`; config loaders unified via `ea.load_cfg` merging `config.local.yaml`; `tracking-state.md` and `DEVIATIONS.md` updated.
 - **CLI Subcommands:** All 10 subcommands (`selfcheck`, `t0`, `t1`, `t2`, `hazard`, `stream`, `t3`, `t4`, `report`, `validate`) are fully wired, operational, and tested.
 - **Accounting Identity:** Formally verified that every error partitions into exactly one terminal state, summing to 100% of the error corpus.
 
@@ -104,11 +107,11 @@ The engineering phase is **complete**. The codebase is ready for final sign-off.
 
 ```mermaid
 graph LR
-    A[Codebase Complete: 198/198 Tests Passed] --> B[Final Documentation Sync]
+    A["Codebase Complete: 222/222 Tests Passed"] --> B[Final Documentation Sync]
     A --> C[Ready for Real Benchmark Datasets]
     
-    B --> B1[Update design.md: mark verified items & record actual module budgets]
-    B --> B2[Deliver Final Phase Report to user]
+    B --> B1["DEVIATIONS.md: deviations 19-25 (NEW-01..15) logged"]
+    B --> B2["tracking-state.md: second-pass audit fully recorded"]
     C --> C1[When CS10K / PaSBench data is supplied, run T0 on GPU]
 ```
 

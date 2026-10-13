@@ -70,17 +70,20 @@ def cache_sample(vlm, s, prompt_text: str, box: list[float] | tuple[float, ...],
 _DINO = {"m": None}
 
 
-def dinov2_pool(img: "Image.Image", box: list[float], out_dim: int = 768) -> np.ndarray | None:
+def dinov2_pool(img: "Image.Image", box: list[float] | None, out_dim: int = 768,
+                model_name: str = "facebook/dinov2-base") -> np.ndarray | None:
     """DINOv2 encoder-ceiling probe features (FR-T4-3): mean patch-token vector
     inside the box on the DINOv2 patch grid (patch 14). Returns None (counted
-    skip by the caller) when the weights are unavailable offline."""
+    skip by the caller) when the weights are unavailable offline or box is None."""
+    if box is None:
+        return None
     import zlib
     import torch
     from PIL import Image as I
     if _DINO["m"] is None:
         try:
             from transformers import AutoModel
-            _DINO["m"] = AutoModel.from_pretrained("facebook/dinov2-base")
+            _DINO["m"] = AutoModel.from_pretrained(model_name)
         except Exception as e:
             print(f"[mech] dinov2 unavailable (offline?): {e!r} — encoder-ceiling "
                   "probe skipped and counted (NFR-5)")

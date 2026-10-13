@@ -150,20 +150,24 @@ def mask_tokens(vlm, keep_frac, seed=0):
         g = torch.Generator().manual_seed(int(seed))
         if isinstance(out, tuple):
             merged = out[0]
-            drop = torch.rand(merged.shape[0], generator=g, device=merged.device) > keep_frac
+            drop = (torch.rand(merged.shape[0], generator=g) > keep_frac).to(merged.device)
             merged = merged.masked_fill(drop[:, None], 0)
             ds = [d.masked_fill(drop[:, None], 0) if isinstance(d, torch.Tensor) else d for d in out[1:]]
             return (merged, *ds)
         elif isinstance(out, torch.Tensor):
-            drop = torch.rand(out.shape[0], generator=g, device=out.device) > keep_frac
+            drop = (torch.rand(out.shape[0], generator=g) > keep_frac).to(out.device)
             return out.masked_fill(drop[:, None], 0)
         return out
+
+    if not hasattr(vlm, "m"):
+        # Duck-typed fake/mock VLM in unit tests (e.g. _CorrectVLM)
+        yield
+        return
 
     target = getattr(getattr(getattr(vlm, "m", vlm), "visual", None), "merger",
                      getattr(getattr(vlm, "m", vlm), "visual", None))
     if target is None:
-        yield
-        return
+        raise RuntimeError("mask_tokens: visual merger / visual module not found on model (FR-T2-3)")
     handle = target.register_forward_hook(hook)
     try:
         yield

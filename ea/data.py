@@ -543,6 +543,26 @@ def _extract_image(img_obj) -> Image.Image | None:
     return None
 
 
+def _probe_video(path: Path | str, default_fps: float = 8.0,
+                 default_duration: float | None = None) -> tuple[float, float | None]:
+    """Probe video fps and duration_s from file via cv2 if available, or return defaults."""
+    p = Path(path)
+    if p.exists():
+        try:
+            import cv2
+            cap = cv2.VideoCapture(str(p))
+            if cap.isOpened():
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                fc = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+                cap.release()
+                if fps > 0:
+                    dur = (fc / fps) if fc > 0 else default_duration
+                    return fps, dur
+        except Exception:
+            pass
+    return default_fps, default_duration
+
+
 def _convert_cs10k(ds, out_dir: Path) -> list["Sample"]:
     """ConstructionSite10k (HF: LouisChen15/ConstructionSite) -> list[Sample].
 
@@ -555,11 +575,13 @@ def _convert_cs10k(ds, out_dir: Path) -> list["Sample"]:
     [VERIFY] Parquet schema, bbox field names, label extraction heuristic.
     """
     import hashlib
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     split = "test" if "test" in ds else next(iter(ds))
     rows = ds[split]
     samples = []
     img_dir = out_dir / "images"
-    img_dir.mkdir(exist_ok=True)
+    img_dir.mkdir(parents=True, exist_ok=True)
 
     _NEG_KEYWORDS = {
         "violation", "missing", "not wearing", "no helmet", "no vest",
@@ -617,12 +639,14 @@ def _convert_pasbench(ds, out_dir: Path) -> list["Sample"]:
     - 'end_s' / 'risk_end' column: risk end timestamp.
     [VERIFY] Exact column names, video storage format, timestamp units.
     """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     split = "test" if "test" in ds else next(iter(ds))
     rows = ds[split]
     samples = []
     skipped = 0
     vid_dir = out_dir / "videos"
-    vid_dir.mkdir(exist_ok=True)
+    vid_dir.mkdir(parents=True, exist_ok=True)
 
     for i, row in enumerate(rows):
         sid = f"pasbench_{i:05d}"
@@ -699,11 +723,13 @@ def _convert_isafetybench(ds, out_dir: Path) -> list["Sample"]:
     - cls: 'industrial_hazard' for hazard clips, 'industrial_normal' for safe.
     - No bounding boxes or MCQ in this HF release; facts are empty.
     """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     split = "train" if "train" in ds else next(iter(ds))
     rows = ds[split]
     samples = []
     vid_dir = out_dir / "videos"
-    vid_dir.mkdir(exist_ok=True)
+    vid_dir.mkdir(parents=True, exist_ok=True)
 
     for i, row in enumerate(rows):
         sid = f"isafetybench_{i:05d}"
@@ -753,11 +779,17 @@ def _convert_isafetybench(ds, out_dir: Path) -> list["Sample"]:
             "source": "iSafetyBench",
             "split": split,
             "scene_type": "hazard" if is_hazard else "normal",
+            "timing_valid": False,  # NEW-05: onset timestamps not in benchmark
         }
         if action_tag:
             meta["action_tag"] = action_tag
         if raw_label is not None:
             meta["raw_label"] = int(raw_label)
+
+        fps_val, dur_val = _probe_video(
+            vid_path, default_fps=float(row.get("fps") or 8.0),
+            default_duration=float(row.get("duration_s") or row.get("duration") or 6.0)
+        )
 
         samples.append(Sample(
             id=sid, bench="isafetybench", modality="video",
@@ -768,7 +800,7 @@ def _convert_isafetybench(ds, out_dir: Path) -> list["Sample"]:
             item=None,
             facts={},
             boxes=[],
-            video=dict(fps=8.0, duration_s=6.0, onset_s=0.0, end_s=6.0),
+            video=dict(fps=fps_val, duration_s=dur_val, onset_s=None, end_s=None),
             meta=meta,
         ))
     return samples
@@ -786,11 +818,13 @@ def _convert_fieldworkarena(ds, out_dir: Path) -> list["Sample"]:
     - Binary label: hazard present / procedure violated -> 1, safe -> 0.
     - When task_type is not present we fall back to answer-based heuristics.
     """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     split = "test" if "test" in ds else next(iter(ds))
     rows = ds[split]
     samples = []
     media_dir = out_dir / "media"
-    media_dir.mkdir(exist_ok=True)
+    media_dir.mkdir(parents=True, exist_ok=True)
 
     _HAZARD_KEYWORDS = {
         "hazard", "danger", "unsafe", "violation", "incorrect", "wrong",
@@ -828,8 +862,10 @@ def _convert_fieldworkarena(ds, out_dir: Path) -> list["Sample"]:
                 except Exception:
                     pass
 
-        # Derive label
-        explicit_label = row.get("label") or row.get("is_violation")
+        # Derive label (NEW-04 fix: 0 is a genuine safe label, do not treat as missing)
+        explicit_label = row.get("label")
+        if explicit_label is None:
+            explicit_label = row.get("is_violation")
         if explicit_label is not None:
             label = int(bool(explicit_label))
         else:
@@ -853,12 +889,28 @@ def _convert_fieldworkarena(ds, out_dir: Path) -> list["Sample"]:
             facts = {}
 
         video_meta = None
+        timing_valid = False
         if modality == "video":
+            dur = float(row.get("duration_s") or row.get("duration") or 10.0)
+            fps_val = float(row.get("fps") or 8.0)
+            if media_path.exists():
+                fps_p, dur_p = _probe_video(media_path, default_fps=fps_val, default_duration=dur)
+                fps_val = fps_p
+                dur = dur_p if dur_p is not None else dur
+            onset_val = row.get("onset_s")
+            end_val = row.get("end_s")
+            if onset_val is not None:
+                onset_val = float(onset_val)
+                end_val = float(end_val) if end_val is not None else dur
+                timing_valid = True
+            else:
+                onset_val = None
+                end_val = None
             video_meta = dict(
-                fps=float(row.get("fps") or 8.0),
-                duration_s=float(row.get("duration_s") or row.get("duration") or 10.0),
-                onset_s=0.0,
-                end_s=float(row.get("duration_s") or row.get("duration") or 10.0),
+                fps=fps_val,
+                duration_s=dur,
+                onset_s=onset_val,
+                end_s=end_val,
             )
 
         samples.append(Sample(
@@ -876,6 +928,7 @@ def _convert_fieldworkarena(ds, out_dir: Path) -> list["Sample"]:
                 "split": split,
                 "task_type": task_type,
                 "answer_raw": str(row.get("answer") or "")[:200],
+                "timing_valid": timing_valid,
             },
         ))
     return samples
@@ -904,8 +957,10 @@ def _convert_ovo_bench_rt(ds, out_dir: Path) -> list["Sample"]:
     """
     import io
 
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     vid_dir = out_dir / "videos"
-    vid_dir.mkdir(exist_ok=True)
+    vid_dir.mkdir(parents=True, exist_ok=True)
     samples: list["Sample"] = []
 
     RT_CATEGORY = "Real-Time Visual Perception"

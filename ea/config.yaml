@@ -6,26 +6,26 @@ model:
   # MODEL_PATH env > config.local.yaml model.path > $HF_HOME snapshot > repo name.
 seed: 0
 exit: {recovery: 0.5, control: 0.1, min_n: 10, conf_margin: 1.0}   # decisions use Wilson CIs (three-valued); errors with |s_base| < conf_margin are borderline and excluded from recovery tests [PROPOSED]
-necessity: {ratio: 0.25}
+necessity: {ratio: 0.25, vn_floor: 0.001}
 consistency: {min_flip: 0.2, ratio: 2.0}
 cost: {miss: 10, false_alarm: 1}
 slices: {max_order: 2, min_support: 30, fdr: 0.05}
 crop: {margin: 0.25}
 knobs:
-  # BUG-04: numbers filled from the checkpoint's preprocessor_config.json
-  # (shortest_edge=65536, longest_edge=16777216). native=null = the checkpoint
-  # default; high pins the checkpoint's own cap explicitly (uncapped images);
-  # low is the degraded-resolution deployment arm (512^2 px area).
-  max_pixels: {low: 262144, native: null, high: 16777216}
+  # NEW-07: native is the deployment resolution cap (1048576, 1024^2 px / ~1 MP)
+  # used by the system under study; low is the degraded arm (262144, 512^2 px / 0.25 MP);
+  # high raises the cap (16777216 / checkpoint cap) and upscales via min_pixels.
+  max_pixels: {low: 262144, native: 1048576, high: 16777216}
   token_budget: [1.0, 0.5, 0.25, 0.1]
   fps: [1, 2, 5, 8]
   window: [4, 8, 16, 32]
   quant: [null, 8bit, 4bit]
   quality: {kinds: [blur, lowlight, noise, haze, jpeg, resample], severities: [1,2,3,4,5]}
 sink: {ratio: 10}
-loc: {shortcut_enrichment: 1.5, equal_delta: 0.15}
+loc: {shortcut_enrichment: 1.5, equal_delta: 0.15, min_samples: 3}
 probe: {decodable_acc: 0.70, selectivity: 0.15}
-t4: {max_samples: 40}
+t3: {gate_samples: 10, gate_pass_rate: 0.7, gate_steps: 4, spray_k: 4}
+t4: {max_samples: 40, causal_min_effect: 0.05, causal_ratio: 2.0, dino_model: facebook/dinov2-base}
 horizon: {frac: 0.95}
 stream: {tolerance_s: 2.0, k: 2, n: 3, c_miss: 1.0, c_early: 0.3, decay_s: 5.0, anticipation_s: 0.0, step_s: 1.0, window: 4, fps: 2.0}   # step_s/window/fps added (BUG-10): the protocol header must report the real settings
 t2: {extra_arms: true}                     # BUG-18: arms no diagnostic consumes yet; set false to save GPU time

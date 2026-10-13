@@ -220,11 +220,12 @@ def explain_necessity(runs: pd.DataFrame, c: Cluster, cfg: dict) -> dict:
     sub = runs[runs.sample_id.isin(set(gated) | set(c.cor_ids))]
 
     ci: dict[str, tuple] = {}
+    vn_floor = float(cfg.get("necessity", {}).get("vn_floor", _VN_FLOOR))
     for arm in arms:
         def _ratio(d, _arm=arm, _gated=gated, _cor_ids=c.cor_ids):
             vn_e = _vn(d, _gated, _arm)
             vn_c = _vn(d, _cor_ids, _arm)
-            if not np.isfinite(vn_c) or vn_c < _VN_FLOOR:
+            if not np.isfinite(vn_c) or vn_c < vn_floor:
                 return np.nan       # corrects' visual necessity ~ 0: ratio undefined -> None
             return vn_e / vn_c
         ci[arm] = boot_ci(_ratio, sub)
@@ -875,19 +876,32 @@ def escalate(
 
     # `stream` diagnostic (H11, FR-ST-5): offline window-vs-stream re-analysis
     # of the stored margin series — trigger policies never need new model runs.
-    # "policy" when the trigger policy (not perception) dominates the lateness.
+    # NEW-01 fix: computed PER CLUSTER restricted to the cluster's own video
+    # error/correct samples; image clusters assign None so H11 is never over-assigned.
     from ea.stream import window_vs_stream_gap
-    gap = window_vs_stream_gap(runs, S, cfg, tau=0.0)
-    stream_diag = "policy" if gap.get("stream_policy") else False
-    if gap.get("n_risk_videos"):
-        print(f"[escalate] stream gap: window={gap.get('window_recall', 0):.2f} "
-              f"stream={gap.get('stream_recall', 0):.2f} policy={gap.get('stream_policy')}")
+    smap = {s.id: s for s in S}
+    corpus_gap = window_vs_stream_gap(runs, S, cfg, tau=0.0)
+    if corpus_gap.get("n_risk_videos"):
+        print(f"[escalate] stream gap (corpus): window={corpus_gap.get('window_recall', 0):.2f} "
+              f"stream={corpus_gap.get('stream_recall', 0):.2f} policy={corpus_gap.get('stream_policy')}")
 
     # Step 4 + 5: diagnostics + decide
     underpowered = 0
     for c in clusters:
         run_diagnostics(c, runs, cfg)
-        c.diags.setdefault("stream", stream_diag)      # H11; external merge wins if present
+        c_video_errs = [eid for eid in c.err_ids if smap.get(eid) and smap[eid].modality == "video"]
+        if not c_video_errs:
+            c_stream_diag = None
+        else:
+            c_sids = set(c.err_ids) | set(c.cor_ids)
+            c_video_samples = [smap[sid] for sid in c_sids if sid in smap and smap[sid].modality == "video"]
+            c_runs = runs[runs.sample_id.isin(c_sids)]
+            c_gap = window_vs_stream_gap(c_runs, c_video_samples, cfg, tau=0.0)
+            if c_gap.get("n_risk_videos", 0) > 0:
+                c_stream_diag = "policy" if c_gap.get("stream_policy") else False
+            else:
+                c_stream_diag = None
+        c.diags.setdefault("stream", c_stream_diag)      # H11; external merge wins if present
         ev = {k: c.diags[k] for k in (
             "crop", "bgmask", "hires", "qr_ok", "sharpen", "knob",
             "qp_ok", "necessity", "consistency", "loc", "t4", "causal", "cue", "stream",

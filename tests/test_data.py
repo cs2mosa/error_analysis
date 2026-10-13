@@ -280,6 +280,8 @@ def test_convert_isafetybench_mock(tmp_path):
     assert samples[0].label == 1
     assert samples[0].cls == "industrial_hazard"
     assert samples[0].video["duration_s"] == 6.0
+    assert samples[0].video["onset_s"] is None       # NEW-05: never fabricate onset 0.0
+    assert samples[0].meta["timing_valid"] is False
     assert samples[1].label == 0
     assert samples[1].cls == "industrial_normal"
     assert Path(samples[0].media).exists()
@@ -305,18 +307,27 @@ def test_convert_fieldworkarena_mock(tmp_path):
                 "fps": 10.0,
                 "duration": 5.0,
             },
+            {
+                "image": im,
+                "label": 0,  # explicit 0: NEW-04 must NOT fall through to keywords
+                "answer": "Safety rules were not missing; no violation observed.",
+                "task_type": "inspection",
+            },
         ]
     }
     out_dir = tmp_path / "fwa_out"
     samples = _convert_fieldworkarena(mock_ds, out_dir)
-    assert len(samples) == 2
+    assert len(samples) == 3
     assert samples[0].modality == "image"
     assert samples[0].label == 1
     assert Path(samples[0].media).exists()
     assert samples[1].modality == "video"
     assert samples[1].label == 0
     assert samples[1].video["fps"] == 10.0
+    assert samples[1].video["onset_s"] is None       # NEW-05: unknown onset is None
+    assert samples[1].meta["timing_valid"] is False
     assert Path(samples[1].media).exists()
+    assert samples[2].label == 0                    # NEW-04: explicit label 0 preserved
 
 
 def test_convert_ovo_bench_rt_mock(tmp_path):
