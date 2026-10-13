@@ -253,6 +253,8 @@ def run(jobs, S, cfg, out="runs.jsonl", vlm_factory=None, failures=None):
     (VLM or FakeVLM). Existing keys are skipped (FR-R-2). Failures default to
     failures.jsonl next to the output file."""
     out, failures = Path(out), Path(failures or (Path(out).parent / "failures.jsonl"))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    failures.parent.mkdir(parents=True, exist_ok=True)
     done = set()
     if out.exists():
         done = {json.loads(l)["key"] for l in open(out, encoding="utf-8") if l.strip()}
@@ -281,8 +283,10 @@ def run(jobs, S, cfg, out="runs.jsonl", vlm_factory=None, failures=None):
 
 
 def _append(path, obj):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, sort_keys=True) + "\n")
+
 
 
 def one(vlm, s, j: Job, k: str, cfg):
@@ -417,6 +421,7 @@ def manifest(cfg, path="manifest.json"):
                machine=platform.node(),
                gpu=(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None),
                t=time.strftime("%Y-%m-%d %H:%M:%S"))
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(man, indent=2, sort_keys=True), encoding="utf-8")
     return man
 
