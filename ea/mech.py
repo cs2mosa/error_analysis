@@ -223,12 +223,15 @@ def horizon(vlm, inp, pos=("Yes",), neg=("No",), L: int = 36, frac: float = 0.95
     s_full = vlm.score_inp(inp, pos, neg)
     with knockout(vlm, inp, [("vis", "q"), ("vis", "last")], range(L)):
         s_blind = vlm.score_inp(inp, pos, neg)
-    if abs(s_full - s_blind) < 1e-4:
+    delta_vis = float(s_full - s_blind)
+    if abs(delta_vis) < 0.05:
         return None
+    sign_vis = 1.0 if delta_vis > 0 else -1.0
     for l in range(L + 1):
         with knockout(vlm, inp, [("vis", "q"), ("vis", "last")], range(l, L)):
             s_l = vlm.score_inp(inp, pos, neg)
-        if (s_l - s_blind) / (s_full - s_blind) >= frac:
+        retained_ratio = float((s_l - s_blind) * sign_vis) / abs(delta_vis)
+        if retained_ratio >= frac:
             return l
     return L
 

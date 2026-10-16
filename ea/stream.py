@@ -152,8 +152,12 @@ def spam_rate(ts: np.ndarray | list[float], S: np.ndarray | list[float], tau: fl
         return float(len(ev) / (duration_s / 60.0))
 
     end_s = end if end is not None else onset + tol
-    dead_events = ev[(ev < onset - tol - ant) | (ev > end_s + tol)]
-    dead_time_s = max(0.0, (onset - tol - ant) - ts[0]) + max(0.0, ts[-1] - (end_s + tol))
+    w_start = onset - tol - ant
+    w_end = end_s + tol
+    dead_events = ev[(ev < w_start) | (ev > w_end)]
+    pre_dead = max(0.0, min(float(ts[-1]), w_start) - float(ts[0]))
+    post_dead = max(0.0, float(ts[-1]) - max(float(ts[0]), w_end))
+    dead_time_s = pre_dead + post_dead
     if dead_time_s <= 0.0:
         return 0.0
     return float(len(dead_events) / (dead_time_s / 60.0))

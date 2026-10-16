@@ -42,6 +42,6 @@ def gate_ok(runs, sample_id, prompts=("qp", "qp_abs", "qr")):
     diagnosis is only issued for samples where Q_P (both polarities) and Q_R
     are correct — otherwise a perception failure is mistaken for a prior
     (2406.08702). Gated-out samples are counted by the caller (NFR-5)."""
-    r = runs[(runs.sample_id == sample_id) & (runs.arm == "base")
-             & runs.prompt_id.isin(prompts) & runs.valid.fillna(True)]
-    return len(r) == len(set(prompts)) and bool(r.correct.all())
+    sub = runs[(runs.sample_id == sample_id) & (runs.arm == "base") & runs.valid.fillna(True)]
+    r = sub[sub.prompt_id.isin(prompts)]
+    return len(r) == len(prompts) and bool(r.correct.all())

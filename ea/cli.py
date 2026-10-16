@@ -403,12 +403,16 @@ def _run_t3(args):
     gate_steps = int(t3_cfg.get("gate_steps", 4))
 
     gate_details, n_valid = [], 0
-    for sid in list(err.sample_id)[:gate_samples]:
+    calib_ids = list(matched_cor.sample_id)[:gate_samples] or list(err.sample_id)[:gate_samples]
+    for sid in calib_ids:
         s = smap[sid]
-        inp = vlm.prep(prompt_text(s), images=[open_img(s)])
+        img = open_img(s)
+        inp = vlm.prep(prompt_text(s), images=[img])
         amap = map_attn(vlm, inp, ratio=ratio)
-        res = explainer_validity_gate(score_fn_factory(s), open_img(s), amap,
-                                      steps=gate_steps, sign=int(2 * s.label - 1))
+        s_base = score_fn_factory(s)(img)
+        model_sign = 1 if s_base >= 0 else -1
+        res = explainer_validity_gate(score_fn_factory(s), img, amap,
+                                      steps=gate_steps, sign=model_sign)
         gate_details.append(dict(sample_id=sid, **res))
         if res.get("valid"):
             n_valid += 1
@@ -617,15 +621,33 @@ def _run_t4(args):
         try:
             s_clean = smap[ids_cor[0]]
             s_corr = smap[ids_err[0]]
-            c_inp = vlm.prep(prompt_text(s_clean), images=[Image.open(s_clean.media).convert("RGB")])
+            c_img = Image.open(s_clean.media).convert("RGB")
+            c_inp = vlm.prep(prompt_text(s_clean), images=[c_img])
             k_inp = vlm.prep(prompt_text(s_corr), images=[Image.open(s_corr.media).convert("RGB")])
+            patch_results = []
             if c_inp["input_ids"].shape == k_inp["input_ids"].shape:
-                p_res = patch_scan(vlm, c_inp, k_inp, PROMPTS["d0"]["pos"], PROMPTS["d0"]["neg"],
-                                   return_raw=True)
-                p_rows = [dict(group=pg, layer=l, recovery=v["recovery"], delta_s=v["delta_s"])
-                          for (pg, l), v in p_res.items()]
+                p_res_pair = patch_scan(vlm, c_inp, k_inp, PROMPTS["d0"]["pos"], PROMPTS["d0"]["neg"],
+                                        return_raw=True)
+                patch_results.append(p_res_pair)
+                p_rows = [dict(corruption="pair", group=pg, layer=l, recovery=v["recovery"], delta_s=v["delta_s"])
+                          for (pg, l), v in p_res_pair.items()]
+
+                # Second corruption: box Gaussian noise per config.yaml (Zhang & Nanda 2023)
+                m_arr = np.asarray(c_img).copy()
+                H, W = m_arr.shape[:2]
+                box = s_clean.boxes[0] if getattr(s_clean, "boxes", None) else [0.25, 0.25, 0.75, 0.75]
+                x0, y0, x1, y1 = int(box[0] * W), int(box[1] * H), int(box[2] * W), int(box[3] * H)
+                m_arr[y0:y1, x0:x1] = np.random.default_rng(0).normal(128, 40, size=(max(1, y1 - y0), max(1, x1 - x0), 3)).clip(0, 255)
+                noise_inp = vlm.prep(prompt_text(s_clean), images=[Image.fromarray(m_arr.astype(np.uint8))])
+                if c_inp["input_ids"].shape == noise_inp["input_ids"].shape:
+                    p_res_box = patch_scan(vlm, c_inp, noise_inp, PROMPTS["d0"]["pos"], PROMPTS["d0"]["neg"],
+                                           return_raw=True)
+                    patch_results.append(p_res_box)
+                    p_rows.extend([dict(corruption="boxnoise", group=pg, layer=l, recovery=v["recovery"], delta_s=v["delta_s"])
+                                   for (pg, l), v in p_res_box.items()])
+
                 pd.DataFrame(p_rows).to_csv(out / "t4_patch.csv", index=False)
-                patch_causal = is_patch_causal([p_res, p_res])
+                patch_causal = is_patch_causal(patch_results)
         except Exception as e:
             print(f"[t4] warning: patch_scan skipped ({e})")
 
