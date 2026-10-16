@@ -17,6 +17,9 @@ import json
 import zlib
 import numpy as np
 import pandas as pd
+from scipy import sparse
+from scipy.sparse.linalg import spsolve
+from scipy.stats import spearmanr, wilcoxon
 from PIL import Image, ImageFilter
 from sklearn.cluster import KMeans
 import torch
@@ -145,21 +148,63 @@ def three_way(enr_err: list[float] | np.ndarray, enr_cor: list[float] | np.ndarr
 
 # ----------------------------------------------------------------- FR-T3-5 deletion / insertion
 
+# ROAD §5.2 neighbour weights: direct 1/6, diagonal 1/12 (sum to 1 for an interior pixel).
+_STENCIL = ((-1, 0, 1 / 6), (1, 0, 1 / 6), (0, -1, 1 / 6), (0, 1, 1 / 6),
+            (-1, -1, 1 / 12), (-1, 1, 1 / 12), (1, -1, 1 / 12), (1, 1, 1 / 12))
+_MAX_EXACT_PIXELS = 150_000
+
+
+def _harmonic_fill(img: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Exact solution of the ROAD linear system: every masked pixel equals the weighted
+    mean of its 8 neighbours, known neighbours moved to the right-hand side. Weights are
+    renormalised over in-image neighbours so border pixels stay convex combinations
+    (maximum principle: the fill never leaves the range of the known pixels).
+    img: float64 [H, W, C]; returns a copy with the masked pixels replaced."""
+    H, W, C = img.shape
+    n = int(mask.sum())
+    idx = np.full((H, W), -1, dtype=np.int64)
+    idx[mask] = np.arange(n)
+    ys, xs = np.nonzero(mask)
+    wsum = np.zeros(n)
+    rhs = np.zeros((n, C))
+    rows, cols, vals = [], [], []
+    for dy, dx, w in _STENCIL:
+        ny, nx = ys + dy, xs + dx
+        ok = (ny >= 0) & (ny < H) & (nx >= 0) & (nx < W)
+        src = np.flatnonzero(ok)
+        wsum[src] += w
+        nb = idx[ny[ok], nx[ok]]
+        unk = nb >= 0
+        rows.append(src[unk]); cols.append(nb[unk]); vals.append(np.full(int(unk.sum()), -w))
+        kn = src[~unk]
+        rhs[kn] += w * img[ny[ok][~unk], nx[ok][~unk]]
+    r, c, v = np.concatenate(rows), np.concatenate(cols), np.concatenate(vals)
+    A = (sparse.identity(n, format="csc") +
+         sparse.coo_matrix((v / wsum[r], (r, c)), shape=(n, n)).tocsc())
+    sol = np.asarray(spsolve(A, rhs / wsum[:, None])).reshape(n, C)
+    out = img.copy()
+    out[mask] = sol
+    return out
+
+
 def nli(img_arr: np.ndarray, mask: np.ndarray,
-        noise_std: float | None = None, seed: int | None = None,
-        iters: int = 20) -> np.ndarray:
+        noise_std: float | None = None, seed: int | None = None) -> np.ndarray:
     """Noisy Linear Imputation (ROAD, 2202.00449 §5.2; design §5.9 [VERIFY] item 11).
 
-    Bootstraps each masked pixel by linear interpolation between boundary pixels,
-    then solves the 2D harmonic inpainting stencil (w_d = 1/6 for orthogonal
-    neighbors, w_i = 1/12 for diagonal neighbors per ROAD Eq. 3-5). Additive
-    Gaussian noise calibrated to unmasked variance is applied to masked pixels.
+    Each masked pixel is the weighted mean of its 8 neighbours (w_d = 1/6, w_i = 1/12),
+    solved exactly as a sparse linear system, as in the authors' reference code. Gaussian
+    noise is then added so the linear dependency cannot be used to spot the filled region.
 
-    Determinism (BUG-09 fix): the noise RNG is seeded explicitly; the default
-    seed derives from the image bytes, so the same image+mask always yields
-    the same fill (NFR-1) without a global-RNG dependency.
+    noise_std: noise standard deviation in pixel units; None -> 0.5 x the std of the
+    unmasked pixels. The paper text states sigma = 0.1 on an unstated pixel scale and the
+    reference implementation defaults to 0.01, so the scale is a calibration choice here.
+    Masks above ~150k pixels are solved on a subsampled grid and bilinearly upsampled
+    (a fill that is converged but smoother than the full-resolution solution).
+
+    Determinism: the noise RNG is seeded explicitly; the default seed derives from the
+    image bytes, so the same image+mask always yields the same fill (NFR-1).
     """
-    out = img_arr.copy()
+    out = np.asarray(img_arr, dtype=np.float64).copy()
     if not mask.any():
         return out
     unmasked = ~mask
@@ -169,43 +214,23 @@ def nli(img_arr: np.ndarray, mask: np.ndarray,
     if seed is None:
         seed = zlib.crc32(np.ascontiguousarray(img_arr).tobytes()) % 2**31
     rng = np.random.default_rng(int(seed))
-    std_val = float(img_arr[unmasked].std()) if noise_std is None else float(noise_std)
+    sigma = (max(1.0, 0.5 * float(out[unmasked].std())) if noise_std is None
+             else float(noise_std))
 
-    H, W = mask.shape
-    # rows with at least one unmasked pixel can be filled by row-wise
-    # interpolation; the remaining (fully masked) rows fall back to a column pass.
-    row_fillable = mask & unmasked.any(axis=1)[:, None]
-    remaining = mask & ~row_fillable
-    idx_cols, idx_rows = np.arange(W), np.arange(H)
-    for c in range(out.shape[2]):
-        ch = out[:, :, c].astype(np.float64)
-        for r in range(H):
-            mrow = row_fillable[r]
-            if not mrow.any():
-                continue
-            ku = idx_cols[~mask[r]]
-            ch[r, mrow] = np.interp(idx_cols[mrow], ku, ch[r, ku])
-        if remaining.any():                              # boundary = unmasked + row-filled
-            known = ~remaining
-            for col in range(W):
-                mcol = remaining[:, col]
-                if not mcol.any():
-                    continue
-                kcols = idx_rows[known[:, col]]
-                ch[mcol, col] = np.interp(idx_rows[mcol], kcols, ch[kcols, col])
-
-        # ROAD 2D harmonic inpainting (2202.00449 §5.2): 8-neighbor stencil relaxation
-        for _ in range(iters):
-            padded = np.pad(ch, 1, mode="edge")
-            stencil = (1.0 / 6.0) * (padded[:-2, 1:-1] + padded[2:, 1:-1] +
-                                     padded[1:-1, :-2] + padded[1:-1, 2:]) + \
-                      (1.0 / 12.0) * (padded[:-2, :-2] + padded[:-2, 2:] +
-                                     padded[2:, :-2] + padded[2:, 2:])
-            ch[mask] = stencil[mask]
-        out[:, :, c] = ch
-
-    noise = rng.normal(0, max(1.0, std_val * 0.5), size=out.shape)
-    out[mask] = out[mask] + noise[mask]
+    n = int(mask.sum())
+    if n <= _MAX_EXACT_PIXELS:
+        filled = _harmonic_fill(out, mask)
+    else:
+        from scipy.ndimage import zoom
+        f = int(np.ceil(np.sqrt(n / _MAX_EXACT_PIXELS)))
+        small_m = mask[::f, ::f]
+        small = _harmonic_fill(out[::f, ::f], small_m) if (~small_m).any() else out[::f, ::f]
+        up = zoom(small, (f, f, 1), order=1)[:out.shape[0], :out.shape[1]]
+        filled = out.copy()
+        filled[mask] = up[mask]
+    out[mask] = filled[mask]
+    if sigma > 0:
+        out[mask] += rng.normal(0.0, sigma, size=out.shape)[mask]
     return out
 
 
@@ -256,58 +281,147 @@ def del_ins(score_fn, img: Image.Image, amap: np.ndarray, mode: str = "del",
 
 # ----------------------------------------------------------------- FR-T3-6 Explainer gate
 
+_FILLS = ("nli", "gray", "blur")
+
+
+def map_spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman rank correlation of two attribution maps (0.0 if either is constant)."""
+    a, b = np.asarray(a, float).ravel(), np.asarray(b, float).ravel()
+    if a.size != b.size or a.size < 2 or np.ptp(a) == 0 or np.ptp(b) == 0:
+        return 0.0
+    return float(spearmanr(a, b)[0])
+
+
 def explainer_validity_gate(score_fn, img: Image.Image, amap: np.ndarray,
                             steps: int = 5, sign: int = 1, seed: int = 0,
-                            ko_fn: callable | None = None) -> dict:
-    """Explainer-validity gate verifying deletion/insertion properties (FR-T3-6).
+                            ko_fn: callable | None = None,
+                            base_map: np.ndarray | None = None,
+                            eps: float = 1e-4) -> dict:
+    """Per-sample explainer-validity checks (FR-T3-6 a, b, e); aggregate with gate_aggregate.
 
-    seed controls both the random comparison map and the nli fill, so the
-    gate verdict is reproducible (BUG-09 fix; NFR-1).
-    ko_fn: optional internal knockout evaluator checking internal agreement (FR-T3-6 e)."""
+    Deletion should score lower and insertion higher than a random-order map under the
+    primary debiased fill. Strict inequality: a tie means the curves carry no evidence, so a
+    model that ignores the image is reported `informative=False` and never valid. The
+    ordering must be the same under every fill (nli, gray, blur): ROAD shows rankings
+    depend on the fill, so a verdict that flips with the fill is not trusted. `sign` is the
+    model's own predicted side (score_fn margin toward the explained decision).
+    base_map: optional raw-attention baseline map to compare against (FR-T3-6 a).
+    ko_fn: callable(flat_cell_idx) -> |s| reduction when those visual tokens are knocked
+    out; internal agreement requires top-quartile cells to beat random cells.
+    seed controls both the random comparison map and the nli fill (NFR-1).
+    """
     amap = np.asarray(amap, dtype=float)
     rng = np.random.default_rng(seed)
     rand_map = rng.uniform(0, 1, size=amap.shape)
 
-    d_expl = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="nli", seed=seed)
-    d_rand = del_ins(score_fn, img, rand_map, mode="del", steps=steps, sign=sign, how="nli", seed=seed)
+    del_by_fill = {}
+    for how in _FILLS:
+        d_e = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how=how, seed=seed)
+        d_r = del_ins(score_fn, img, rand_map, mode="del", steps=steps, sign=sign, how=how, seed=seed)
+        del_by_fill[how] = (float(d_e), float(d_r))
+    i_expl = float(del_ins(score_fn, img, amap, mode="ins", steps=steps, sign=sign, how="nli", seed=seed))
+    i_rand = float(del_ins(score_fn, img, rand_map, mode="ins", steps=steps, sign=sign, how="nli", seed=seed))
 
-    i_expl = del_ins(score_fn, img, amap, mode="ins", steps=steps, sign=sign, how="nli", seed=seed)
-    i_rand = del_ins(score_fn, img, rand_map, mode="ins", steps=steps, sign=sign, how="nli", seed=seed)
+    d_expl, d_rand = del_by_fill["nli"]
+    beats = {how: bool(de < dr - eps) for how, (de, dr) in del_by_fill.items()}
+    del_beats_rand = beats["nli"]
+    ins_beats_rand = bool(i_expl > i_rand + eps)
+    informative = bool(abs(d_expl - d_rand) > eps or abs(i_expl - i_rand) > eps)
+    fill_stable = len(set(beats.values())) == 1
 
-    # Faithful explainer should have lower deletion AUC and higher insertion AUC than random
-    del_beats_rand = bool(d_expl <= d_rand + 1e-4)
-    ins_beats_rand = bool(i_expl >= i_rand - 1e-4)
+    d_base = i_base = None
+    if base_map is not None:
+        base_map = np.asarray(base_map, dtype=float)
+        d_base = float(del_ins(score_fn, img, base_map, mode="del", steps=steps, sign=sign,
+                               how="nli", seed=seed))
+        i_base = float(del_ins(score_fn, img, base_map, mode="ins", steps=steps, sign=sign,
+                               how="nli", seed=seed))
 
-    # Fill stability: check del AUC under gray and blur
-    d_gray = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="gray", seed=seed)
-    d_blur = del_ins(score_fn, img, amap, mode="del", steps=steps, sign=sign, how="blur", seed=seed)
-    fill_stable = bool(abs(d_gray - d_blur) < 5.0)
-
-    # Internal agreement check (FR-T3-6 item e / arXiv:2509.04588)
     internal_agreement = None
     if ko_fn is not None:
         flat_order = np.argsort(-amap.ravel())
         top_k = flat_order[:max(1, len(flat_order) // 4)]
         rand_k = rng.choice(len(flat_order), size=len(top_k), replace=False)
-        eff_top = float(ko_fn(top_k))
-        eff_rand = float(ko_fn(rand_k))
-        internal_agreement = bool(eff_top >= eff_rand)
+        internal_agreement = bool(float(ko_fn(top_k)) >= float(ko_fn(rand_k)))
 
-    valid = bool(del_beats_rand and ins_beats_rand and fill_stable and
+    valid = bool(informative and del_beats_rand and ins_beats_rand and fill_stable and
                  (internal_agreement is None or internal_agreement))
     return dict(
-        valid=valid,
-        del_expl=float(d_expl),
-        del_rand=float(d_rand),
-        ins_expl=float(i_expl),
-        ins_rand=float(i_rand),
-        d_gray=float(d_gray),
-        d_blur=float(d_blur),
-        del_beats_rand=del_beats_rand,
-        ins_beats_rand=ins_beats_rand,
-        fill_stable=fill_stable,
+        valid=valid, informative=informative,
+        del_expl=d_expl, del_rand=d_rand, ins_expl=i_expl, ins_rand=i_rand,
+        del_base=d_base, ins_base=i_base,
+        d_gray=del_by_fill["gray"][0], d_blur=del_by_fill["blur"][0],
+        del_beats_rand=del_beats_rand, ins_beats_rand=ins_beats_rand,
+        del_beats_rand_by_fill=beats, fill_stable=fill_stable,
         internal_agreement=internal_agreement,
     )
+
+
+def _paired_p(a, b, alternative: str, min_n: int):
+    """One-sided paired Wilcoxon p-value of a vs b; None if fewer than min_n non-zero pairs."""
+    d = np.array([x - y for x, y in zip(a, b) if x is not None and y is not None], dtype=float)
+    d = d[np.abs(d) > 1e-12]
+    if len(d) < min_n:
+        return None
+    return float(wilcoxon(d, alternative=alternative).pvalue)
+
+
+def gate_aggregate(details: list[dict], alpha: float = 0.05, min_pass_rate: float = 0.7,
+                   min_n: int = 5, randomization_rho: list[float] | None = None,
+                   robustness_rho: list[float] | None = None,
+                   rand_rho_max: float = 0.5, noise_rho_min: float = 0.6) -> dict:
+    """Dataset-level explainer gate (FR-T3-6; design §5.9).
+
+    Requires: paired Wilcoxon p < alpha against the random-order map for deletion (lower)
+    and insertion (higher); non-inferiority to the raw-attention baseline when it was
+    computed (not significantly worse; sink filtering may legitimately tie it); a per-sample pass rate >= min_pass_rate; mean Spearman(map, map after layer
+    re-initialization) < rand_rho_max (the map must depend on the learned weights); mean
+    Spearman(map, map under small pixel noise) >= noise_rho_min. A check whose inputs were
+    not supplied is listed in `skipped` and does not count as a pass or a failure.
+    """
+    n = len(details)
+    n_valid = sum(bool(d.get("valid")) for d in details)
+    pass_rate = n_valid / n if n else 0.0
+    col = lambda k: [d.get(k) for d in details]
+    p_del = _paired_p(col("del_expl"), col("del_rand"), "less", min_n)
+    p_ins = _paired_p(col("ins_expl"), col("ins_rand"), "greater", min_n)
+    has_base = any(d.get("del_base") is not None for d in details)
+    # raw-attention baseline: superiority p-values are informational; the sink-filtered map is
+    # raw attention minus sink tokens, so ties are expected. The requirement is non-inferiority:
+    # no significant evidence that the explainer is WORSE than raw attention.
+    p_del_b = _paired_p(col("del_expl"), col("del_base"), "less", min_n) if has_base else None
+    p_ins_b = _paired_p(col("ins_expl"), col("ins_base"), "greater", min_n) if has_base else None
+    worse_del = _paired_p(col("del_expl"), col("del_base"), "greater", min_n) if has_base else None
+    worse_ins = _paired_p(col("ins_expl"), col("ins_base"), "less", min_n) if has_base else None
+    base_ok = not any(p is not None and p < alpha for p in (worse_del, worse_ins))
+
+    skipped, ok = [], True
+    stat_ps = [p_del, p_ins]
+    stats_ok = all(p is not None and p < alpha for p in stat_ps)
+    ok &= stats_ok and base_ok and pass_rate >= min_pass_rate
+    rand_ok = rob_ok = None
+    if randomization_rho is None:
+        skipped.append("randomization")
+    else:
+        rand_ok = bool(len(randomization_rho) and np.mean(randomization_rho) < rand_rho_max)
+        ok &= rand_ok
+    if robustness_rho is None:
+        skipped.append("robustness")
+    else:
+        rob_ok = bool(len(robustness_rho) and np.mean(robustness_rho) >= noise_rho_min)
+        ok &= rob_ok
+    if not n:
+        status = "no samples"
+    elif any(p is None for p in stat_ps):
+        status = f"under-powered (< {min_n} informative paired samples)"
+    else:
+        status = "computed (FR-T3-6)"
+    return dict(valid=bool(ok and n), status=status, n_samples=n, n_valid=n_valid,
+                pass_rate=round(pass_rate, 3), p_del_rand=p_del, p_ins_rand=p_ins,
+                p_del_base=p_del_b, p_ins_base=p_ins_b, baseline_not_worse=base_ok,
+                randomization=dict(ok=rand_ok, mean_rho=(None if randomization_rho is None or not len(randomization_rho) else float(np.mean(randomization_rho)))),
+                robustness=dict(ok=rob_ok, mean_rho=(None if robustness_rho is None or not len(robustness_rho) else float(np.mean(robustness_rho)))),
+                skipped=skipped)
 
 
 # ----------------------------------------------------------------- FR-T3-7 & FR-T3-8 SpRAy & confounder

@@ -73,7 +73,8 @@ def test_activation_patching_multi_corruption_fidelity():
 # ----------------------------------------------------------------- 3. Information Horizon (arXiv:2512.07580)
 
 def test_information_horizon_negative_shift():
-    """Information horizon must handle visual evidence that reduces margin (s_full < s_blind)."""
+    """Retained-fraction ratio is sign-safe when visual evidence lowers the margin (s_full < s_blind).
+    The sign handling itself was never broken; the noise-floor guard is covered in test_fidelity_fixes."""
     class MockVLM:
         def __init__(self):
             self.m = type("M", (), {"model": type("LM", (), {"language_model": type("L", (), {"layers": [None] * 36})()})()})()
@@ -136,20 +137,14 @@ def test_spam_rate_clip_outside_risk_window():
 # ----------------------------------------------------------------- 5. ReCoVERR (arXiv:2402.15610)
 
 def test_selective_prediction_coverage_at_recall():
-    """Coverage at target recall evaluates max accepted fraction over all prefixes (FR-B-13)."""
-    # 4 samples: confidences [.9, .8, .2, .1]
-    # Positive items at idx0, idx1. Predictions: idx0, idx1 positive.
-    conf = np.array([0.9, 0.2, 0.8, 0.1])
-    pred = np.array([1.0, 1.0, 0.0, 0.0])
-    y = np.array([1, 1, 0, 0])
-
-    # For reachable recall rec=1.0, coverage recovers to max prefix (1.0)
-    assert coverage_at_recall(conf, pred, y, rec=1.0) == pytest.approx(1.0)
-    assert coverage_at_recall(conf, pred, y, rec=0.5) == pytest.approx(1.0)
-
-    # For unreachable recall (target 1.0 when model achieves 0.5), coverage is 0.0
-    unreachable = np.array([1.0, 0.0, 0.0, 0.0])
-    assert coverage_at_recall(conf, unreachable, y, rec=1.0) == 0.0
+    """Coverage@Recall is the largest accepted fraction whose accepted-set recall meets the
+    target; recall can dip and recover, so every prefix is considered (FR-B-13)."""
+    conf = np.array([0.9, 0.8, 0.7, 0.6])
+    y = np.ones(4, dtype=int)
+    pred = np.array([1.0, 0.0, 1.0, 1.0])               # prefix recall: 1, .5, .667, .75
+    assert coverage_at_recall(conf, pred, y, rec=0.7) == pytest.approx(1.0)
+    assert coverage_at_recall(conf, pred, y, rec=0.8) == pytest.approx(0.25)
+    assert coverage_at_recall(conf, np.zeros(4), y, rec=0.5) == 0.0
 
 
 # ----------------------------------------------------------------- 6. VLind-Bench (arXiv:2406.08702)

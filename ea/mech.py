@@ -217,21 +217,28 @@ def lens(vlm, inp, pos=("Yes",), neg=("No",)) -> list[float]:
 
 # ----------------------------------------------------------------- FR-T4-7 information horizon
 
-def horizon(vlm, inp, pos=("Yes",), neg=("No",), L: int = 36, frac: float = 0.95) -> int | None:
-    """Information-horizon layer: smallest layer where blocking visual flow retains >= frac of effect (FR-T4-7)."""
+def horizon(vlm, inp, pos=("Yes",), neg=("No",), L: int = 36, frac: float = 0.95,
+            min_effect: float = 0.05) -> int | None:
+    """Information-horizon layer: smallest l such that blocking visual->(question, last)
+    attention from layer l onward keeps >= frac of the full visual effect (FR-T4-7).
+
+    Sample-level adaptation of the horizon of 2512.07580 (which measures per-token output
+    change under removal): the retained fraction is the ratio
+    (s_l - s_blind) / (s_full - s_blind), identical for either sign of the visual shift.
+    Returns None when |s_full - s_blind| < min_effect (the visual effect is inside the
+    bf16 logit noise floor and the ratio would be noise).
+    """
     from ea.model import knockout
     s_full = vlm.score_inp(inp, pos, neg)
     with knockout(vlm, inp, [("vis", "q"), ("vis", "last")], range(L)):
         s_blind = vlm.score_inp(inp, pos, neg)
     delta_vis = float(s_full - s_blind)
-    if abs(delta_vis) < 0.05:
+    if abs(delta_vis) < min_effect:
         return None
-    sign_vis = 1.0 if delta_vis > 0 else -1.0
     for l in range(L + 1):
         with knockout(vlm, inp, [("vis", "q"), ("vis", "last")], range(l, L)):
             s_l = vlm.score_inp(inp, pos, neg)
-        retained_ratio = float((s_l - s_blind) * sign_vis) / abs(delta_vis)
-        if retained_ratio >= frac:
+        if float(s_l - s_blind) / delta_vis >= frac:
             return l
     return L
 
@@ -279,22 +286,26 @@ def patch_scan(vlm, clean_inp, corr_inp, pos=("Yes",), neg=("No",), L: int = 36,
 
 def is_patch_causal(patch_results: list[dict], min_recovery: float = 0.3,
                     min_delta_s: float = 0.5) -> bool:
-    """Robustness check (C13 / FR-T4-8; 2309.16042):
-    A patching result counts as causal only if it holds under >= 2 corruption
-    methods and BOTH metrics (normalized recovery >= min_recovery and raw |delta_s| >= min_delta_s).
+    """Robustness check (C13 / FR-T4-8; 2309.16042).
+
+    Causal only if one patch site, a (group, layer-window) cell, clears BOTH metrics
+    (normalized recovery >= min_recovery and raw |delta_s| >= min_delta_s) under >= 2
+    corruption methods. Requiring the *same* site in every arm keeps a different
+    accidental cell per arm from passing, and keeps the many-cells-per-arm scan from
+    inflating the pass rate.
     """
     if len(patch_results) < 2:
         return False
-    passed_corruptions = 0
-    for p in patch_results:
-        has_causal = any(
-            (v["recovery"] >= min_recovery and abs(v.get("delta_s", 0.0)) >= min_delta_s)
-            if isinstance(v, dict) else (v >= min_recovery)
-            for v in p.values()
-        )
-        if has_causal:
-            passed_corruptions += 1
-    return passed_corruptions >= 2
+
+    def passing(p):
+        return {k for k, v in p.items()
+                if ((v["recovery"] >= min_recovery and abs(v.get("delta_s", 0.0)) >= min_delta_s)
+                    if isinstance(v, dict) else v >= min_recovery)}
+
+    sites = passing(patch_results[0])
+    for p in patch_results[1:]:
+        sites &= passing(p)
+    return bool(sites)
 
 
 # ----------------------------------------------------------------- FR-T4-9 token similarity

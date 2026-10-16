@@ -230,7 +230,10 @@ def knockout(vlm, inp, spec, layers):
     Re-entrant (BUG-20 fix): closure variables per context invocation, no global clobbering."""
     g = vlm.groups(inp)
     target_layers = set(layers)
-    blocks = [(g[a], g[b]) for a, b in spec]
+    # a spec endpoint is a group name or an explicit LongTensor of token positions
+    # (internal-agreement check: knock out a chosen subset of visual tokens).
+    blocks = [(g[a] if isinstance(a, str) else a, g[b] if isinstance(b, str) else b)
+              for a, b in spec]
     hk = []
     m = getattr(vlm.m, "model", vlm.m)
     lm = getattr(m, "language_model", m)
@@ -264,6 +267,38 @@ def knockout(vlm, inp, spec, layers):
     finally:
         for h in hk:
             h.remove()
+
+
+@contextmanager
+def randomized_layers(vlm, frac=0.5, seed=0, std=0.02):
+    """Re-initialize the top `frac` of LLM layers, restoring them on exit (FR-T3-6 c).
+
+    Model-parameter randomization sanity check (Adebayo et al. 2018): an explainer that
+    depends on the learned weights must change when they are destroyed. Floating weights
+    are drawn from N(0, std); integer (8-bit quantized) weights from a uniform int range.
+    Originals are held on the CPU so the check fits on small GPUs.
+    """
+    m = getattr(vlm.m, "model", vlm.m)
+    lm = getattr(m, "language_model", m)
+    layers = list(getattr(lm, "layers", []))
+    if not layers:
+        raise RuntimeError("randomized_layers: no decoder layers found on the model")
+    start = int(len(layers) * (1.0 - float(frac)))
+    g = torch.Generator().manual_seed(int(seed))
+    saved = []
+    try:
+        for L in layers[start:]:
+            for p in L.parameters():
+                saved.append((p, p.data.cpu().clone()))
+                if p.data.is_floating_point():
+                    new = torch.randn(p.shape, generator=g).mul_(std)
+                else:
+                    new = torch.randint(-127, 128, p.shape, generator=g)
+                p.data.copy_(new.to(device=p.device, dtype=p.dtype))
+        yield
+    finally:
+        for p, d in saved:
+            p.data.copy_(d.to(p.device))
 
 
 def attn_last(vlm, inp):

@@ -246,21 +246,21 @@ def coverage_at_risk(conf, err, r):
 
 
 def coverage_at_recall(conf, s, y, rec):
-    """Coverage achievable while keeping recall >= target among accepted
-    positives (FR-B-13). Max accepted fraction over ALL prefixes (recall can
-    dip and recover, so an early break would under-report coverage)."""
+    """Largest accepted fraction whose *accepted-set* recall is >= rec (FR-B-13).
+
+    Accept the k most confident samples; recall of that set is
+    (accepted positives predicted positive) / (accepted positives). It is not monotone in k
+    (an accepted positive predicted negative lowers it, later hits raise it), so the maximum
+    is taken over all prefixes. Prefixes holding no positive are skipped. Returns 0.0 when
+    no prefix reaches the target.
+    """
     conf, s, y = np.asarray(conf, float), np.asarray(s, float), np.asarray(y)
-    order = np.argsort(-conf)
-    pred_pos = s > 0
-    total_pos = (y == 1).sum()
-    out, tp = 0.0, 0
-    for k in range(1, len(order) + 1):
-        sel = order[:k]
-        tp += int(pred_pos[sel[k - 1]] and y[sel[k - 1]] == 1)
-        recall = (tp / total_pos) if total_pos else 1.0
-        if recall >= rec:
-            out = k / len(order)
-    return out
+    order = np.argsort(-conf, kind="stable")
+    is_pos = (y == 1)[order]
+    hit = ((s > 0) & (y == 1))[order]
+    n_pos, n_hit = np.cumsum(is_pos), np.cumsum(hit)
+    ok = (n_pos > 0) & (n_hit >= rec * n_pos - 1e-12)
+    return float((np.flatnonzero(ok).max() + 1) / len(order)) if ok.any() else 0.0
 
 
 # ------------------------------------------------------------ recovery (FR-B-15/18)

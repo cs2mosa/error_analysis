@@ -363,6 +363,69 @@ def _make_eager_vlm(cfg, args):
     return VLM(model_ref(cfg, override=args.model), attn="eager")
 
 
+def _explainer_gate(vlm, calib_ids, smap, prompt_text, open_img, score_fn_factory, t3_cfg, ratio):
+    """Run the FR-T3-6 explainer-validity gate on calibration samples and aggregate it:
+    per-sample deletion/insertion vs random and raw-attention maps (debiased fill, rank
+    stability across fills, internal agreement), then paired Wilcoxon, the layer
+    re-initialization sanity check and the noise-robustness check (gate_aggregate)."""
+    import numpy as np
+    import torch
+    from PIL import Image
+    from ea.prompts import PROMPTS
+    from ea.attrib import (map_attn, map_spearman, explainer_validity_gate, gate_aggregate)
+    from ea.model import knockout, randomized_layers
+
+    gate_steps = int(t3_cfg.get("gate_steps", 4))
+    pos, neg = PROMPTS["d0"]["pos"], PROMPTS["d0"]["neg"]
+    lm = getattr(getattr(vlm.m, "model", vlm.m), "language_model", None)
+    n_layers = len(getattr(lm, "layers", []))
+    sigma = float(t3_cfg.get("gate_noise_sigma", 0.02)) * 255.0
+
+    gate_details, cal, noise_rho, skipped_reason = [], [], [], {}
+    nrng = np.random.default_rng(0)
+    for sid in calib_ids:
+        s = smap[sid]
+        img = open_img(s)
+        inp = vlm.prep(prompt_text(s), images=[img])
+        amap = map_attn(vlm, inp, ratio=ratio)
+        base_map = map_attn(vlm, inp, ratio=float("inf"))        # raw attention, sinks kept
+        s_base = score_fn_factory(s)(img)
+        g = vlm.groups(inp)
+
+        def ko_fn(idx, inp=inp, g=g, s_base=s_base):
+            sub = g["vis"][torch.as_tensor(np.asarray(idx), device=g["vis"].device)]
+            with knockout(vlm, inp, [(sub, "last")], range(n_layers)):
+                return abs(s_base) - abs(vlm.score_inp(inp, pos, neg))
+
+        res = explainer_validity_gate(score_fn_factory(s), img, amap, steps=gate_steps,
+                                      sign=1 if s_base >= 0 else -1,
+                                      ko_fn=ko_fn if n_layers else None, base_map=base_map)
+        gate_details.append(dict(sample_id=sid, **res))
+        cal.append((inp, amap))
+
+        noisy = Image.fromarray((np.asarray(img, float) + nrng.normal(0, sigma, (img.height, img.width, 3))
+                                 ).clip(0, 255).astype(np.uint8))
+        noise_rho.append(map_spearman(amap, map_attn(
+            vlm, vlm.prep(prompt_text(s), images=[noisy]), ratio=ratio)))
+
+    rand_rho = None
+    try:
+        with randomized_layers(vlm, frac=float(t3_cfg.get("gate_rand_frac", 0.5)), seed=0):
+            rand_rho = [map_spearman(a0, map_attn(vlm, i0, ratio=ratio)) for i0, a0 in cal]
+    except RuntimeError as e:
+        skipped_reason["randomization"] = str(e)
+
+    gate = gate_aggregate(
+        gate_details, alpha=float(t3_cfg.get("gate_alpha", 0.05)),
+        min_pass_rate=float(t3_cfg.get("gate_pass_rate", 0.7)),
+        randomization_rho=rand_rho, robustness_rho=noise_rho or None,
+        rand_rho_max=float(t3_cfg.get("gate_rand_rho_max", 0.5)),
+        noise_rho_min=float(t3_cfg.get("gate_noise_rho_min", 0.6)))
+    gate.update(tag=None if gate["valid"] else "UNVALIDATED",
+                skipped_reason=skipped_reason, details=gate_details)
+    return gate
+
+
 def _run_t3(args):
     """T3 attribution tier (FR-T3): attention/gradient maps on the token grid,
     localization vs the GT box, the 3-way `loc` reading per cluster, the
@@ -396,34 +459,15 @@ def _run_t3(args):
         text, pos, neg = prompt_text(s), PROMPTS["d0"]["pos"], PROMPTS["d0"]["neg"]
         return lambda im: vlm.score_inp(vlm.prep(text, images=[im]), pos, neg)
 
-    # --- explainer-validity gate (FR-T3-6): computed on real deletion curves
+    # --- explainer-validity gate (FR-T3-6): per-sample checks, then a dataset-level test
     t3_cfg = cfg.get("t3", {})
-    gate_samples = int(t3_cfg.get("gate_samples", 10))
-    gate_pass_rate = float(t3_cfg.get("gate_pass_rate", 0.7))
-    gate_steps = int(t3_cfg.get("gate_steps", 4))
-
-    gate_details, n_valid = [], 0
-    calib_ids = list(matched_cor.sample_id)[:gate_samples] or list(err.sample_id)[:gate_samples]
-    for sid in calib_ids:
-        s = smap[sid]
-        img = open_img(s)
-        inp = vlm.prep(prompt_text(s), images=[img])
-        amap = map_attn(vlm, inp, ratio=ratio)
-        s_base = score_fn_factory(s)(img)
-        model_sign = 1 if s_base >= 0 else -1
-        res = explainer_validity_gate(score_fn_factory(s), img, amap,
-                                      steps=gate_steps, sign=model_sign)
-        gate_details.append(dict(sample_id=sid, **res))
-        if res.get("valid"):
-            n_valid += 1
-    pass_rate = (n_valid / len(gate_details)) if gate_details else 0.0
-    gate_valid = bool(gate_details and pass_rate >= gate_pass_rate)
-    gate = dict(valid=gate_valid, pass_rate=round(pass_rate, 3),
-                n_samples=len(gate_details), n_valid=n_valid,
-                status="computed (FR-T3-6)" if gate_details else "no error samples",
-                tag=None if gate_valid else "UNVALIDATED", details=gate_details)
-    (out / "t3_gate.json").write_text(json.dumps(gate, indent=2), encoding="utf-8")
-    print(f"[t3] explainer gate: valid={gate['valid']} (pass_rate={gate['pass_rate']}, {len(gate_details)} samples)")
+    calib_ids = list(matched_cor.sample_id)[:int(t3_cfg.get("gate_samples", 10))] \
+        or list(err.sample_id)[:int(t3_cfg.get("gate_samples", 10))]
+    gate = _explainer_gate(vlm, calib_ids, smap, prompt_text, open_img, score_fn_factory,
+                           t3_cfg, ratio)
+    (out / "t3_gate.json").write_text(json.dumps(gate, indent=2, default=float), encoding="utf-8")
+    print(f"[t3] explainer gate: valid={gate['valid']} ({gate['status']}; pass_rate={gate['pass_rate']}, "
+          f"p_del={gate['p_del_rand']}, p_ins={gate['p_ins_rand']}, skipped={gate['skipped']})")
 
     # --- maps + localization for errors and matched corrects (O(1) dictionary lookup)
     rows, enr_map = [], {}

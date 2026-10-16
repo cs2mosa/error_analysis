@@ -200,14 +200,16 @@ def test_aurc_worse_when_errors_ranked_high():
 
 
 def test_coverage_at_recall_all_prefixes():
-    # recall dips at k=1 (second positive not yet accepted) then recovers:
+    # accepted-set recall by prefix (conf order idx0, idx2, idx1, idx3): 1, 1, 1, 1
     conf = np.array([.9, .2, .8, .1])
     pred = np.array([1, 1, 0, 0])                      # positives: idx0, idx1
     y = np.array([1, 1, 0, 0])
-    assert M.coverage_at_recall(conf, pred, y, 1.0) == pytest.approx(1.0)  # max prefix, not first
-    assert M.coverage_at_recall(conf, pred, y, 0.5) == pytest.approx(1.0)
-    unreachable = np.array([1, 0, 0, 0])
-    assert M.coverage_at_recall(conf, unreachable, y, 1.0) == 0.0
+    assert M.coverage_at_recall(conf, pred, y, 1.0) == pytest.approx(1.0)
+    # idx1 (an accepted positive) predicted negative: recall 1, 1, .5, .5 -> only k<=2 meet 1.0
+    missed = np.array([1, 0, 0, 0])
+    assert M.coverage_at_recall(conf, missed, y, 1.0) == pytest.approx(0.5)
+    assert M.coverage_at_recall(conf, missed, y, 0.5) == pytest.approx(1.0)
+    assert M.coverage_at_recall(conf, np.zeros(4), y, 0.5) == 0.0   # no positive prediction at all
 
 
 # ------------------------------------------------------------ recovery / margin shift (FR-B-15/18)

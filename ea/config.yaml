@@ -24,7 +24,9 @@ knobs:
 sink: {ratio: 10}
 loc: {shortcut_enrichment: 1.5, equal_delta: 0.15, min_samples: 3}
 probe: {decodable_acc: 0.70, selectivity: 0.15}
-t3: {gate_samples: 10, gate_pass_rate: 0.7, gate_steps: 4, spray_k: 4}
+t3: {gate_samples: 10, gate_pass_rate: 0.7, gate_steps: 4, spray_k: 4,
+     gate_alpha: 0.05, gate_rand_frac: 0.5, gate_rand_rho_max: 0.5,
+     gate_noise_sigma: 0.02, gate_noise_rho_min: 0.6}
 t4: {max_samples: 40, causal_min_effect: 0.05, causal_ratio: 2.0, dino_model: facebook/dinov2-base}
 horizon: {frac: 0.95}
 stream: {tolerance_s: 2.0, k: 2, n: 3, c_miss: 1.0, c_early: 0.3, decay_s: 5.0, anticipation_s: 0.0, step_s: 1.0, window: 4, fps: 2.0}   # step_s/window/fps added (BUG-10): the protocol header must report the real settings

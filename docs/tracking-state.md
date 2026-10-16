@@ -65,7 +65,7 @@ The design document initially drafted reference sketches marked with `[VERIFY]` 
 ### 3.2 Methodological Refinements Logged in [DEVIATIONS.md](file:///f:/error_analysis/DEVIATIONS.md)
 The following enhancements were logged in [`DEVIATIONS.md`](file:///f:/error_analysis/DEVIATIONS.md):
 - **Deviation 3 (`metrics.py`):** `fpr_at_recall` updated from naive interpolation to selecting the minimal operational FPR satisfying $\text{recall} \ge \text{target}$.
-- **Deviation 4 (`metrics.py`):** `coverage_at_recall` updated to evaluate max accepted fraction across all prefixes rather than breaking on first dip.
+- **Deviation 4 (`metrics.py`):** `coverage_at_recall` is accepted-set recall maximised over all prefixes (the earlier global-denominator form was degenerate; see DEVIATIONS 4 and docs/paper_reconciliation_plan.md §4).
 - **Deviation 8 (`config.yaml`):** Quote the `"null":` key under YAML 1.1 rules to avoid silent parsing as Python `None`.
 - **Deviation 10 (`attrib.py`):** Use `getattr(np, "trapezoid", getattr(np, "trapz", None))` for NumPy 2.0+ compatibility.
 - **Deviation 11 (`metrics.py` / `escalate.py`):** Added optional `ci=True` parameter to `margin_shift`. Inner diagnostic sweeps pass `ci=False`, cutting verification runtime from >5 minutes to <3 seconds.
